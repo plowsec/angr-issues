@@ -21,8 +21,8 @@ import angr.sim_type
 from angr.state_plugins.plugin import SimStatePlugin
 from copy import deepcopy
 
-
 logging.basicConfig(level=logging.DEBUG)
+
 
 class SimStateDeepGlobals(SimStatePlugin):
     """Based on angr's original globals state plugin, only difference is this one deep copies"""
@@ -328,7 +328,7 @@ def analyze(angr_proj):
     globals.cfg = angr_proj.analyses.CFGFast()
 
     # Enumerate functions
-    # angr_enum_functions(angr_proj)
+    angr_enum_functions(angr_proj)
 
     # Set hooks
     set_hooks(angr_proj)
@@ -375,7 +375,10 @@ def analyze(angr_proj):
     logger.debug(globals.simgr.active[0].regs.rip)
     globals.phase = 2
 
-    globals.simgr.explore(find=[0x000000014000109D],
+    # 00000001400010D0 loop overflow
+    # 0x000000014000109D simple overflow
+    globals.simgr.explore(find=[0x00000001400011E0],
+                          avoid=[0x00000001400010E0],
                           step_func=check_for_vulns,
                           )
 
@@ -395,6 +398,7 @@ def analyze(angr_proj):
 
         found = s.one_found
         logger.debug("Found state")
+        logger.debug(f'found: {found}')
     else:
         logger.debug("No found state")
 

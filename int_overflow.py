@@ -64,36 +64,19 @@ def get_regs(irsb, idx):
     return set(tainted_regs)
 
 
-def check_tmp(state, stmt, output, input_val):
-    tmps = state.scratch.temps
 
-    try:
-        if state.solver.satisfiable(
-                extra_constraints=[tmps[output] < tmps[input_val]]
-        ):
-            logger.debug("Overflow: %s" % pp_stmt(stmt, tmps, [input_val, output]))
-            return True
-    except claripy.errors.ClaripyOperationError:
-        logger.warning("Claripy solver error while checking for overflow")
-
-
-def all_temps_available(state, input_val, output):
-    tmps = state.scratch.temps
-
-    if len(tmps) < output or len(tmps) < input_val:
-        return False
-    if tmps[output] is None or tmps[input_val] is None:
-        return False
-
-    return True
 
 
 def print_disassembly(state):
-    block = state.project.factory.block(state.addr)
-    disassembly = block.capstone
+    try:
+        block = state.project.factory.block(state.addr)
+        disassembly = block.capstone
 
-    for insn in disassembly.insns:
-        logger.debug(f"{insn.address:#x}: {insn.mnemonic} {insn.op_str}")
+        for insn in disassembly.insns:
+            logger.debug(f"{insn.address:#x}: {insn.mnemonic} {insn.op_str}")
+
+    except Exception as e:
+        logger.debug(f"Error printing disassembly: {e}")
 
 
 """
@@ -131,67 +114,48 @@ manual proof:
 """
 
 
-def check_symbolic_tmps(curr_state: angr.sim_state.SimState, statements, idx: int, stmt, output, input):
-    print_disassembly(curr_state)
 
+
+def resolve_operand_value(curr_state, statements, operand):
+    if isinstance(operand, int):
+        return resolve_tmp_value(curr_state, statements, operand, is_output=True)
+    elif isinstance(operand, claripy.ast.bv.BV):
+        return operand
+    elif isinstance(operand, pyvex.expr.RdTmp):
+        return resolve_tmp_value(curr_state, statements, operand.tmp)
+    elif isinstance(operand, pyvex.expr.Const):
+        return claripy.BVV(operand.con.value, operand.con.size)
+    else:
+        raise TypeError(f"Unsupported operand type: {type(operand)}")
+
+
+def resolve_tmp_value(curr_state, statements, tmp, is_output=False):
     temps = curr_state.scratch.temps
 
-    if len(temps) < output or temps[output] is None:
-        logger.debug(f"Symbolic output: {output}")
-        # resolve the symbolic tmp
-        stmts = get_slice(statements, output)
-        print(stmts)
+    if len(temps) < tmp or temps[tmp] is None or is_output:
+        logger.debug(f"Symbolic tmp: {tmp}")
+        stmts = get_slice(statements, tmp)
+        for stmt in stmts:
+            logger.debug(f"stmt: {stmt.__str__()}")
         df = DataFlowAnalyzer(curr_state)
         tmp_values, tmp_taint, operand_map = df.process_irsb(stmts)
-        output_val = tmp_values[output]
+        return tmp_values[tmp]
     else:
-        output_val = temps[output]
+        return temps[tmp]
 
-    if len(temps) < input or temps[input] is None:
-        logger.debug(f"Symbolic input: {input}")
-        # resolve the symbolic tmp1
-        stmts = get_slice(statements, input)
-        print(stmts)
-        df = DataFlowAnalyzer(curr_state)
-        tmp_values, tmp_taint, operand_map = df.process_irsb(stmts)
-        input_val = tmp_values[input]
+
+def adjust_length(output_val, input_val):
+    if output_val.length != input_val.length:
+        logger.debug(f"Length mismatch: {output_val.length} != {input_val.length}")
+        if output_val.length < input_val.length:
+            input_val = claripy.Extract(output_val.length - 1, 0, input_val)
+        else:
+            input_val = claripy.ZeroExt(output_val.length - input_val.length, input_val)
     else:
-        input_val = temps[input]
+        logger.debug(f"Good length: {output_val.length} == {input_val.length}")
+    return input_val
 
-    if isinstance(output_val, claripy.ast.bv.BV) and isinstance(input_val, claripy.ast.bv.BV):
-        if output_val.length != input_val.length:
-            logger.debug(f"Length mismatch: {output_val.length} != {input_val.length}")
-            if output_val.length < input_val.length:
-                input_val = claripy.Extract(output_val.length - 1, 0, input_val)
-            else:
-                logger.debug(f"Length mismatch: {output_val.length} != {input_val.length}")
-        else:
-            logger.debug(f"Good length: {output_val.length} == {input_val.length}")
 
-        const_to_add_bv = claripy.BVV(stmt.data.args[1].con.value, 32)
-        result = input_val + const_to_add_bv
-
-        # Define the range constraints
-        lower_bound = claripy.BVV(0, 32)
-        upper_bound = const_to_add_bv
-
-        # Create the condition for the range
-        range_cond = claripy.And(result > lower_bound, result < upper_bound)
-        #res = curr_state.solver.satisfiable(extra_constraints=[overflow_cond])
-        # Add the range condition to the solver
-        solver = curr_state.solver
-        solver.add(range_cond)
-
-        # Check if the range condition is satisfiable
-        if res := solver.satisfiable():
-            # Solve for a concrete value that satisfies the constraints
-            concrete_value = solver.eval(input_val)
-            print(f"A concrete value that works is: {concrete_value}")
-
-        else:
-            print("No value satisfies the condition.")
-        logger.debug(f"Integer overflow: {res}")
-    pass
 
 
 def get_slice(statements, target_tmp):
@@ -216,63 +180,183 @@ def get_slice(statements, target_tmp):
                         taint_set.add(stmt.data.args[0].tmp)
                 elif isinstance(stmt.data, pyvex.expr.Const):
                     pass  # Constants do not add new taints
+                elif isinstance(stmt.data, pyvex.expr.RdTmp):
+                    taint_set.add(stmt.data.tmp)
                 else:
                     raise ValueError(f"Unhandled statement type: {type(stmt.data)}")
 
     return list(reversed(relevant_statements))
 
 
+def check_tmp(state, stmt, output, input_val1, input_val2=None):
+    tmps = state.scratch.temps
+
+    if state.solver.satisfiable(
+            extra_constraints=[tmps[output] < tmps[input_val1]]
+    ):
+        logger.debug("Overflow: %s" % pp_stmt(stmt, tmps, [input_val1, output]))
+        return True
+
+    if input_val2 is not None:
+        if state.solver.satisfiable(
+                extra_constraints=[tmps[output] < tmps[input_val2]]
+        ):
+            logger.debug("Overflow: %s" % pp_stmt(stmt, tmps, [input_val2, output]))
+            return True
+
+    return False
+
+
+def all_temps_available(state, input_val1, input_val2, output):
+    tmps = state.scratch.temps
+
+    if len(tmps) < output or len(tmps) < input_val1 or len(tmps) < input_val2:
+        return False
+    if tmps[output] is None or tmps[input_val1] is None or tmps[input_val2] is None:
+        return False
+
+    return True
+
+
+def check_overflow(curr_state, result, input1, input2, signed=False):
+    state = curr_state.copy()
+    solver = state.solver
+
+    if signed:
+        # Signed overflow detection
+        sign_bit = result.size() - 1
+        input1_sign = input1[sign_bit]
+        input2_sign = input2[sign_bit]
+        result_sign = result[sign_bit]
+
+        # Overflow occurs if input1 and input2 have the same sign, but result has a different sign
+        overflow_cond = claripy.And(input1_sign == input2_sign, input1_sign != result_sign)
+    else:
+        # Unsigned overflow detection
+        overflow_cond = claripy.Or(result < input1, result < input2)
+
+    solver.add(overflow_cond)
+    return solver.satisfiable()
+
+
+def check_symbolic_tmps(curr_state: angr.sim_state.SimState, statements, idx: int, stmt, output, input1, input2):
+    print_disassembly(curr_state)
+
+    output_val = resolve_operand_value(curr_state, statements, output)
+    input1_val = resolve_operand_value(curr_state, statements, input1)
+    input2_val = resolve_operand_value(curr_state, statements, input2)
+
+    if isinstance(output_val, claripy.ast.bv.BV) and isinstance(input1_val, claripy.ast.bv.BV) and isinstance(input2_val, claripy.ast.bv.BV):
+        input1_val = adjust_length(output_val, input1_val)
+        input2_val = adjust_length(output_val, input2_val)
+
+        result = input1_val + input2_val
+        is_signed = False
+        logger.warning(f"Checking for overflow ({output}, {input1}, {input2}: {input1_val} + {input2_val} = {result}")
+        logger.debug(curr_state.solver.constraints)
+        if check_overflow(curr_state, result, input1_val, input2_val, signed=is_signed):
+            concrete_value1 = curr_state.solver.eval(input1_val)
+            concrete_value2 = curr_state.solver.eval(input2_val)
+            logger.warning(f"Concrete values that work are: {concrete_value1}, {concrete_value2}")
+        else:
+            logger.warning("No values satisfy the condition.")
+    else:
+        logger.debug("Unsupported operand type")
+
+
+def extract_operand(curr_state, vex, idx, stmt, input_operands):
+
+    """
+
+    steps:
+
+    1. Check if both operands are available in scratch
+    2. If not, extract the operands from the statements (Const or RdTmp)
+
+    """
+    both_operands_available = True
+    input_tmps = []
+
+    for operand in input_operands:
+
+        if (hasattr(operand, 'tmp')):
+            if len(curr_state.scratch.temps) > operand.tmp:
+                input_val = curr_state.scratch.temps[operand.tmp]
+                if input_val is None:
+                    both_operands_available = False
+                    break
+                else:
+                    input_tmps.append(operand.tmp)
+            else:
+                both_operands_available = False
+                break
+
+    if both_operands_available:
+        logger.debug("Both operands are available in scratch")
+        try:
+            check_tmp(curr_state, stmt, stmt.tmp, input_tmps[0])
+        except:
+            both_operands_available = False
+
+
+    if not both_operands_available:
+        logger.debug("Extracting operands from statements")
+        input1 = input_operands[0]
+        input2 = input_operands[1]
+        check_symbolic_tmps(curr_state, vex.statements, idx, stmt, stmt.tmp, input1, input2)
+
+
 def check_for_vulns(simgr, proj):
     if len(simgr.stashes["active"]) < 1:
         return False
 
-    # get current and previous states
     curr_state = simgr.stashes["active"][0]
+    print_disassembly(curr_state)
+
+    if curr_state.project.is_hooked(curr_state.addr):
+        return False
 
     if curr_state.solver.symbolic(curr_state._ip):
-        # cannot handle states with symbolic program counters
         return True
 
     sym_obj = proj.loader.find_symbol(curr_state.addr, fuzzy=True)
-    if not sym_obj is None and sym_obj.name == "__libc_start_main.after_main":
+    if sym_obj and sym_obj.name == "__libc_start_main.after_main":
         return True
 
-    # we can analyze, check basic block for blown (over or underflown) bitvectors
     block = curr_state.block(curr_state.addr)
+    logger.debug(f"Checking block at {hex(curr_state.addr)}")
     vex = block.vex
     cap = block.capstone
 
     rbp_off = curr_state.arch.registers["rbp"][0]
     rsp_off = curr_state.arch.registers["rsp"][0]
 
-    blown_tmps = dict()  # tmps that are over or underflowed, value is a tag
+
     for idx, stmt in enumerate(vex.statements):
-        if isinstance(stmt, pyvex.stmt.WrTmp) and isinstance(
-                stmt.data, pyvex.expr.Binop
-        ):
-            # check if binop is arithmetic that can over/underflow and if so, detect any blown tmps
+        if isinstance(stmt, pyvex.stmt.WrTmp) and isinstance(stmt.data, pyvex.expr.Binop):
             if not isinstance(stmt.data.args[0], pyvex.expr.RdTmp):
-                continue  # not a tmp
+                continue
 
             regs = get_regs(vex, idx)
 
             if rbp_off in regs or rsp_off in regs:
-                continue  # rsp and rbp manipulations are always lifted into overflowing statements
+                continue
 
             mnemonic = cap.insns[get_capstone_from_vex(vex, idx)].mnemonic
-            if (mnemonic.startswith("add") or mnemonic.startswith('inc')) and (
-                    stmt.data.op.startswith("Iop_Add") or stmt.data.op.startswith("Iop_Shl")
-            ):
+            if (mnemonic.startswith("add") or mnemonic.startswith('inc')) and \
+               (stmt.data.op.startswith("Iop_Add") or stmt.data.op.startswith("Iop_Shl")):
                 logger.debug("Checking for overflow on t%d" % stmt.tmp)
-                input = stmt.data.args[0].tmp
+                input_operands = [stmt.data.args[0], stmt.data.args[1]]
+                extract_operand(curr_state, vex, idx, stmt, input_operands)
+                """
+                
                 output = stmt.tmp
-                if all_temps_available(curr_state, input, output):
-                    if check_tmp(
-                            curr_state, stmt, output, input
-                    ):
+                if all_temps_available(curr_state, input_operands, output):
+                    if check_tmp(curr_state, stmt, output, input1.tmp):
                         logger.debug("t%d is overflowed" % stmt.tmp)
                 else:
-                    check_symbolic_tmps(curr_state, vex.statements, idx, stmt, output, input)
+                    check_symbolic_tmps(curr_state, vex.statements, idx, stmt, output, input1, input2)
+                """
 
             else:
                 # TODO: mul and sub

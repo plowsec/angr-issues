@@ -1,6 +1,7 @@
 from typing import Dict, Any, Tuple
 
 import angr
+import claripy
 import networkx as nx
 import pyvex
 
@@ -30,12 +31,10 @@ class DataFlowAnalyzer:
 
         self.state: angr.sim_state.SimState = state
 
-
     # Function to get the value of a temporary variable
     @staticmethod
     def get_tmp_value(tmp, tmp_values):
         return tmp_values.get(tmp, None)
-
 
     # Function to perform intra-instruction taint analysis
     def handle_wr_tmp(self, stmt, tmp_values, tmp_taint, operand_map):
@@ -61,7 +60,7 @@ class DataFlowAnalyzer:
         src_tmp = stmt.data.tmp
         tmp_values[stmt.tmp] = tmp_values.get(src_tmp)
         logger.debug(
-            f"RdTmp: src_tmp={src_tmp}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+            f"RdTmp: src_tmp={src_tmp}, tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
 
     def handle_wr_tmp_unop(self, stmt, tmp_values, tmp_taint, operand_map):
 
@@ -70,13 +69,42 @@ class DataFlowAnalyzer:
             src_tmp = stmt.data.args[0].tmp
             if tmp_values.get(src_tmp) is None:
                 logger.error(f"Unop: Source temp value is None, stmt={stmt}")
-            tmp_values[stmt.tmp] = tmp_values.get(src_tmp)
+                raise ValueError(f"Unop: Source temp value is None, stmt={stmt}")
+
+            if stmt.data.op.startswith('Iop_32to64'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.SignExt(64, x)
+            elif stmt.data.op.startswith('Iop_64to32'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.Extract(31, 0, x)
+            elif stmt.data.op.startswith('Iop_8Uto32'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.ZeroExt(24, x)
+            elif stmt.data.op.startswith('Iop_8Sto32'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.SignExt(24, x)
+            elif stmt.data.op.startswith('Iop_16Uto32'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.ZeroExt(16, x)
+
+            elif stmt.data.op.startswith('Iop_16Sto32'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.SignExt(16, x)
+            elif stmt.data.op.startswith('Iop_32Uto64'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.ZeroExt(32, x)
+            elif stmt.data.op.startswith('Iop_32Sto64'):
+                x = tmp_values.get(src_tmp)
+                tmp_values[stmt.tmp] = claripy.SignExt(32, x)
+            else:
+                logger.error(f"Unop: Operation not handled, stmt={stmt}")
+                raise ValueError(f"Unop: Operation not handled, stmt={stmt}")
+
             logger.debug(
                 f"Unop: src_tmp={src_tmp}, tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
+
             if src_tmp in operand_map:
                 operand_map[stmt.tmp] = operand_map[src_tmp]
-
-
 
     def handle_wr_tmp_load(self, stmt, tmp_values, tmp_taint, operand_map):
 
@@ -118,7 +146,6 @@ class DataFlowAnalyzer:
                 self.stack_variables[addr] = StackVariableOperand(OperandKind.SOURCE, addr, value, "unknown")
                 operand_map[stmt.tmp] = self.stack_variables.get(addr)
 
-
             new_tmp_value = self.stack_variables.get(addr).value if addr in self.stack_variables else None
 
             if new_tmp_value is None:
@@ -132,7 +159,6 @@ class DataFlowAnalyzer:
             logger.debug(
                 f"Load: addr_tmp={addr_tmp}, addr={addr}, tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
 
-
     def handle_wr_tmp_get(self, stmt, tmp_values, tmp_taint, operand_map):
         """Handle WrTmp statements with Get data."""
         reg_name = lift.get_register_name(stmt.data.offset)
@@ -145,10 +171,8 @@ class DataFlowAnalyzer:
 
         tmp_values[stmt.tmp] = new_tmp_value
 
-
         logger.debug(
             f"Get: reg_name={reg_name}, tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
-
 
     def handle_wr_tmp_const(self, stmt, tmp_values, tmp_taint):
         """Handle WrTmp statements with Const data."""
@@ -158,7 +182,6 @@ class DataFlowAnalyzer:
             f"Const: tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
 
     def handle_wr_tmp_binop(self, stmt, tmp_values, tmp_taint, operand_map):
-
 
         """Handle WrTmp statements with Binop data."""
         arg0 = self.get_tmp_value(stmt.data.args[0].tmp, tmp_values) if isinstance(stmt.data.args[0],
@@ -194,8 +217,16 @@ class DataFlowAnalyzer:
         """Handle Binop with the first argument as RdTmp."""
         operand = operand_map.get(stmt.data.args[0].tmp)
         if operand is None:
-            logger.warning(f"Binop: Operand is None, stmt={stmt}")
-            return
+            if tmp_values.get(stmt.data.args[0].tmp) is None:
+
+                logger.warning(f"Binop: Operand is None, stmt={stmt}")
+                return
+            else:
+
+                logger.warning(f"Binop: Operand was None, trying to create a new one, stmt={stmt}")
+                operand = RegisterOperand(OperandKind.SOURCE, tmp_values.get(stmt.data.args[0].tmp),
+                                          tmp_values.get(stmt.data.args[0].tmp), "unknown")
+
         if isinstance(operand, StackVariableOperand):
             offset = stmt.data.args[1].con.value if isinstance(stmt.data.args[1], pyvex.expr.Const) else None
             if offset is not None:
@@ -218,7 +249,7 @@ class DataFlowAnalyzer:
                 operand_map[stmt.tmp] = RegisterOperand(OperandKind.SOURCE, address,
                                                         tmp_values.get(stmt.data.args[0].tmp),
                                                         name)
-                logger.debug(f"Register + offset: {name}, address={hex(address)}, pyvex_name={stmt.tmp}")
+                logger.debug(f"Register + offset: {name}, address={address}, pyvex_name={stmt.tmp}")
 
     def handle_binop_second_rdtmp(self, stmt, tmp_values, operand_map, arg0, arg1):
         """Handle Binop with the second argument as RdTmp."""
@@ -238,7 +269,8 @@ class DataFlowAnalyzer:
         """Handle Binop operations."""
         if stmt.data.op.startswith('Iop_Add') or stmt.data.op.startswith('Iop_And') or stmt.data.op.startswith(
                 'Iop_Sub') or stmt.data.op.startswith('Iop_Xor') or stmt.data.op.startswith(
-            'Iop_Shl') or stmt.data.op.startswith('Iop_Or') or stmt.data.op.startswith('Iop_Mul') or stmt.data.op.startswith('Iop_Shr'):
+            'Iop_Shl') or stmt.data.op.startswith('Iop_Or') or stmt.data.op.startswith(
+            'Iop_Mul') or stmt.data.op.startswith('Iop_Shr'):
             if arg0 is not None and arg1 is not None:
                 size_in_bits = stmt.data.tag_int * 8
                 mask = (1 << size_in_bits) - 1
@@ -315,7 +347,6 @@ class DataFlowAnalyzer:
                     if isinstance(self.stack_variables[addr].value, tuple):
                         self.stack_variables[addr].value = self.stack_variables[addr].value[0]
 
-
                     logger.debug(
                         f"Store: addr={addr}, stack_variables[{addr}]={self.stack_variables[addr].value}")
             else:
@@ -381,4 +412,3 @@ class DataFlowAnalyzer:
         logger.debug(f"operand_map: {operand_map}")
 
         return tmp_values, tmp_taint, operand_map
-

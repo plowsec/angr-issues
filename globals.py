@@ -1,6 +1,8 @@
+import angr
+
 DO_NOTHING = 0
 FIRST_ADDR = 0x444f0000
-proj = None
+proj: angr.Project = None
 mycc = None
 cfg = None
 phase = 1

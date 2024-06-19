@@ -260,7 +260,7 @@ class DataFlowAnalyzer:
                 name = f"rsp+0x{hex(offset)}"
                 address = operand.address + offset
                 operand_map[stmt.tmp] = StackVariableOperand(OperandKind.SOURCE, address, operand.value, name)
-                logger.debug(f"Stack variable offset: {name}, address={hex(address)}, pyvex_name={stmt.tmp}")
+                logger.debug(f"Stack variable offset: {name}, address={address}, pyvex_name={stmt.tmp}")
 
             else:
                 logger.error(f"Binop: Stack variable offset is None, stmt={stmt}")

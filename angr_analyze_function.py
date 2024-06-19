@@ -1,3 +1,4 @@
+import functools
 import pickle
 
 import angr
@@ -22,6 +23,16 @@ from angr.state_plugins.plugin import SimStatePlugin
 from copy import deepcopy
 
 logging.basicConfig(level=logging.DEBUG)
+
+# List to store tracked stack buffers
+tracked_buffers = {} # dict: function address -> list of stack variables
+
+# Set to track analyzed functions
+analyzed_functions = set()
+
+oob_addresses = set()
+
+
 
 
 class SimStateDeepGlobals(SimStatePlugin):
@@ -179,9 +190,12 @@ def inspect_call(state):
     human_str = state.project.loader.describe_addr(state.addr)
     logger.debug(
         f'call {hex(state.addr)} ({human_str}) from {hex(state.history.addr)} ({state.project.loader.describe_addr(state.addr)})')
-    if "extern-address" in human_str:
+    if "extern-address" in human_str and not state.project.is_hooked(state.addr):
         logger.warning(f"Implement hook for {hex(state.addr)} ({human_str})")
         pass
+
+    if not globals.proj.is_hooked(state.addr):
+        analyze_stack_vars(state)
 
 
 def next_base_addr(size=0x10000):
@@ -311,12 +325,274 @@ def set_hooks(proj):
 
 
 def check_for_vulns(*args, **kwargs):
+
+
     sm = args[0]
+
+    for state in sm.active:
+        if state.loop_data.current_loop is not None and len(state.loop_data.current_loop) > 0:
+            logger.debug(f'loop: {state.loop_data.current_loop}')
+
     int_overflow.check_for_vulns(sm, globals.proj)
     """for state in sm.active:
         logger.debug(f'{state.addr} {state.regs.rip}')
         detect_overflow(state)
     """
+
+
+def inspect_concretization(state):
+    # Log the event type
+    logger.debug("Address concretization event triggered")
+
+    # Log the SimAction object being used to record the memory action
+    action = state.inspect.address_concretization_action
+    logger.debug(f"SimAction: {action}")
+
+    # Log the SimMemory object on which the action was taken
+    memory = state.inspect.address_concretization_memory
+    logger.debug(f"SimMemory: {memory}")
+
+    # Log the AST representing the memory index being resolved
+    expr = state.inspect.address_concretization_expr
+    logger.debug(f"AST expression: {expr}")
+
+    # Log whether or not constraints should/will be added for this read
+    add_constraints = state.inspect.address_concretization_add_constraints
+    logger.debug(f"Add constraints: {add_constraints}")
+
+    # Log the list of resolved memory addresses (only available after concretization)
+    if state.inspect.address_concretization_result is not None:
+        result = state.inspect.address_concretization_result
+        logger.debug(f"Resolved addresses: {result}")
+
+
+def analyze_stack_vars(state):
+    func_addr = state.addr
+    if func_addr in analyzed_functions:
+        return
+
+    analyzed_functions.add(func_addr)
+    func = state.project.kb.functions.function(addr=func_addr)
+    logger.debug(f'Analyzing function: {func}')
+
+    a = state.project.analyses.VariableRecoveryFast(store_live_variables=True, func=func, track_sp=True, )
+    fn_manager = a.variable_manager.function_managers.get(func.addr)
+    stack_vars = [x for x in fn_manager.get_variables() if
+                  isinstance(x, angr.analyses.variable_recovery.variable_recovery_fast.SimStackVariable)]
+
+    # get min and max stack offset
+    min_offset = 0
+    max_offset = 0
+    for var in stack_vars:
+        if var.offset < min_offset:
+            min_offset = var.offset
+        if var.offset + var.size > max_offset:
+            max_offset = var.offset + var.size
+
+
+    tracked_buffers[func.addr] = []
+
+    for var in stack_vars:
+        var_addr = state.solver.eval(state.regs.bp + var.offset)
+        tracked_buffers[func.addr].append((var.offset, var.size, (min_offset, max_offset)))
+        logger.debug(f'Detected stack variable: {var} at {hex(var_addr)} of size {var.size}. Base {hex(var.base_addr) if var.base_addr is not None else 0}. Offset {hex(var.offset) if var.offset is not None else 0}')
+
+    dec = globals.proj.analyses.Decompiler(func, cfg=globals.cfg.model)
+    logger.debug(dec.codegen.text)
+
+def get_function_containing_address(proj, addr):
+    for addr in proj.kb.functions:
+        f = proj.kb.functions[addr]
+        if f.addr <= addr < f.addr + f.size:
+            return f
+    return None
+
+
+def is_stack_operation(state):
+    """
+    Determine if the current instruction is a stack operation such as return, push, or call.
+    """
+    ip = state.solver.eval(state.regs.rip)
+    #insn = state.block().capstone.insns[state.inspect.instruction_index]
+    for insn in state.block().capstone.insns:
+        if insn.address == ip:
+            logger.debug(f"0x{insn.address:x}:\t{insn.mnemonic}\t{insn.op_str}")
+            break
+    else:
+        logger.warning(f"Instruction not found at address 0x{ip:x}")
+        return False
+
+    mnemonic = insn.mnemonic
+    logger.debug(f"Instruction mnemonic: {mnemonic}")
+    return mnemonic in ['ret', 'push', 'call']
+
+
+@functools.lru_cache(maxsize=128)
+def get_function_stack_offset(func):
+
+    first_block = globals.proj.factory.block(func.addr)
+
+    # find the IRSB statement that sets the stack pointer
+    for stmt in first_block.vex.statements:
+
+        if stmt.tag != 'Ist_Put':
+            continue
+
+        if stmt.offset == globals.proj.arch.registers['sp'][0]:
+            logger.debug(f"Stack pointer set to {stmt.data}")
+            if stmt.data.tag == 'Iex_RdTmp':
+                t = stmt.data.tmp
+                logger.debug(f"Stack pointer set to {t}")
+                break
+            else:
+                raise(f"Unhandled stack pointer set: {stmt.data}")
+
+    else:
+        raise("Stack pointer not found")
+
+    # find the IRSB statement that does the stack pointer arithmetic
+    for stmt in first_block.vex.statements:
+
+        if stmt.tag != 'Ist_WrTmp':
+            continue
+
+        if stmt.tmp != t:
+            continue
+
+        if stmt.data.op.startswith('Iop_Sub'):
+            logger.debug(f"Stack pointer arithmetic: {stmt.data}")
+            operands = stmt.data.args
+            break
+    else:
+        raise("Stack pointer arithmetic not found")
+
+
+    # find the const value that is subtracted from the stack pointer
+    for operand in operands:
+        if operand.tag == 'Iex_Const':
+            logger.debug(f"Stack pointer subtracted by {operand}")
+            stack_offset = operand.con.value
+            break
+    else:
+
+        raise Exception("Stack pointer offset not found")
+
+    return stack_offset
+
+
+
+def check_oob_write(state):
+
+    if globals.proj.is_hooked(state.addr):
+        return
+
+    mem_addr = state.inspect.mem_write_address
+    mem_length = state.inspect.mem_write_length
+
+    if mem_addr is None or mem_length is None:
+        return
+
+    mem_addr = state.solver.eval(mem_addr)
+    mem_length = state.solver.eval(mem_length)
+
+    if mem_addr in oob_addresses:
+        return
+
+    if not state.regs.sp.concrete:
+        logger.critical(f"SP is symbolic: {state.regs.sp}")
+        return
+
+    sp_val = state.solver.eval(state.regs.sp)
+    rip = state.solver.eval(state.regs.rip)
+    logger.debug(f"[{hex(rip)}] Memory write at {hex(mem_addr)} of size {mem_length} (sp: {hex(sp_val)})")
+
+    # get the function address
+    fn = get_function_containing_address(globals.proj, rip)
+    if fn is None:
+        logger.warning(f"Function not found for address {state.addr}")
+        return
+
+
+    # manual
+    tracked_buffers_fn = tracked_buffers.get(fn.addr)
+
+    if tracked_buffers_fn is None:
+        logger.warning(f"No tracked buffers for function {fn.name}")
+        analyze_stack_vars(state)
+        tracked_buffers_fn = tracked_buffers.get(fn.addr)
+        if tracked_buffers_fn is None:
+            logger.warning(f"Still no tracked buffers for function {fn.name}")
+            return
+
+    # angr's solution
+    fn_kb_var = globals.proj.kb.variables.function_managers.get(fn.addr)
+    stack_min_offset = min(fn_kb_var._stack_region._storage.keys())
+    stack_max_offset = max(fn_kb_var._stack_region._storage.keys())
+    accessed_var = fn_kb_var.find_variables_by_insn(state.addr, "memory")
+    if accessed_var is not None:
+        logger.debug(f"Accessed variable: {accessed_var}")
+        logger.debug(f"Stack min offset: {stack_min_offset}")
+        logger.debug(f"Stack max offset: {stack_max_offset}")
+    else:
+        logger.error(f"(angr) OOB write detected at {hex(mem_addr)} (sp+{hex(mem_addr-sp_val)}) of size {mem_length}")
+
+
+    get_function_stack_offset(fn)
+
+    min_offset, max_offset = tracked_buffers_fn[0][2]
+
+    first_block = globals.proj.factory.block(fn.addr)
+
+    offset_diff = 0
+    if rip > first_block.addr + first_block.size:
+        try:
+            offset_diff = get_function_stack_offset(fn)
+            sp_val += offset_diff
+        except:
+            logger.critical(f"Failed to get stack offset for function {fn.name}")
+            return
+
+    # Check if the memory write is within the stack range
+    if sp_val + min_offset <= mem_addr < sp_val + max_offset:
+        for buffer in tracked_buffers_fn:
+            buf_offset, buf_size, _ = buffer
+            buf_addr = sp_val + buf_offset
+            if buf_addr <= mem_addr < buf_addr + buf_size:
+                # This is a known buffer, check for out-of-bounds
+                if mem_addr + mem_length > buf_addr + buf_size:
+                    logger.warning(f"Out-of-bounds write detected at {hex(mem_addr)} (sp+{hex(mem_addr-sp_val)}) of size {mem_length}")
+                    is_stack_operation(state)
+                else:
+                    logger.debug(f"Write at {hex(mem_addr)} (sp+{hex(mem_addr-sp_val)}) of size {mem_length} is within bounds of buffer at {hex(buf_addr)} (sp+{hex(buf_offset)}) (size {buf_size})")
+                return
+
+        # If the write is not within any known buffer, it might be OOB
+        if not is_stack_operation(state):
+            logger.warning(f"[{hex(state.addr)}] Potential out-of-bounds write detected at sp+{hex(mem_addr-sp_val)} of size {mem_length}")
+            oob_addresses.add(mem_addr)
+    else:
+        logger.debug(f"Write at {hex(mem_addr)} ({hex(mem_addr-sp_val)}) of size {mem_length} is not within stack bounds? ({hex(sp_val+min_offset)}-{hex(sp_val+max_offset)})")
+        if mem_addr > sp_val + max_offset:
+            logger.debug(f"Write is above stack bounds: {hex(mem_addr-(sp_val+max_offset))}")
+        else:
+            logger.debug(f"Write is below stack bounds: -{hex(sp_val+min_offset-mem_addr)}")
+        logger.debug(f"Stack pointer: {hex(sp_val)}")
+
+
+def analyze_stack_vars2():
+
+    # 0x140001500
+    func = globals.proj.kb.functions.function(addr=0x140001500)
+    logger.debug(f'function: {func}')
+    a = globals.proj.analyses.VariableRecoveryFast(store_live_variables=True, func=func, track_sp=True)
+    fn_manager = a.variable_manager.function_managers.get(func.addr)
+    stack_vars = [x for x in fn_manager.get_variables() if isinstance(x, angr.analyses.variable_recovery.variable_recovery_fast.SimStackVariable)]
+    for var in stack_vars:
+        logger.debug(f'var: {var}')
+
+
+    logger.debug("Done")
+
 
 
 def analyze(angr_proj):
@@ -325,10 +601,12 @@ def analyze(angr_proj):
     addr_target = 0x0000000140001000
 
     # Get control flow graph.
-    globals.cfg = angr_proj.analyses.CFGFast()
+    globals.cfg = angr_proj.analyses.CFGFast(normalize=True )
 
     # Enumerate functions
     angr_enum_functions(angr_proj)
+    globals.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True)
+
 
     # Set hooks
     set_hooks(angr_proj)
@@ -359,8 +637,18 @@ def analyze(angr_proj):
     state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
     state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
     state.options.add(angr.options.SYMBOLIC_INITIAL_VALUES)
+    state.options.add(angr.options.LAZY_SOLVES)
+    state.options.add(angr.options.SYMBOLIC_MEMORY_NO_SINGLEVALUE_OPTIMIZATIONS)
+    state.options.add(angr.options.CONSTRAINT_TRACKING_IN_SOLVER)
+    state.options.add(angr.options.TRACK_CONSTRAINTS)
+    state.options.add(angr.options.TRACK_TMP_ACTIONS)
     # state.options.add(angr.options.SYMBOLIC_TEMPS)
     state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
+    #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
+    #state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
+    # Set up the memory write inspection point
+    state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
+
     state.register_plugin("deep", SimStateDeepGlobals())
 
     # state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
@@ -370,16 +658,17 @@ def analyze(angr_proj):
     # globals.simgr.use_technique(angr.exploration_techniques.LocalLoopSeer(bound=globals.args.bound))
 
     # globals.simgr.use_technique(angr.exploration_techniques.LengthLimiter(globals.args.length))
-    # globals.simgr.use_technique(angr.exploration_techniques.
+    #globals.simgr.use_technique(angr.exploration_techniques.LoopSeer(cfg=globals.cfg, bound=50))
     # globals.simgr.step()
     logger.debug(globals.simgr.active[0].regs.rip)
     globals.phase = 2
+    #analyze_stack_vars()
 
     # 00000001400010D0 loop overflow
     # 0x000000014000109D simple overflow
-    globals.simgr.explore(find=[0x00000001400011E0],
-                          avoid=[0x00000001400010E0],
-                          step_func=check_for_vulns,
+    globals.simgr.explore(find=[0x140001397],
+                          #avoid=[0x00000001400010E0],
+                          #step_func=check_for_vulns,
                           )
 
     # IPython.embed()

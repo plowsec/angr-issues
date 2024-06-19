@@ -130,18 +130,16 @@ def resolve_operand_value(curr_state, statements, operand):
 
 
 def resolve_tmp_value(curr_state, statements, tmp, is_output=False):
-    temps = curr_state.scratch.temps
 
-    if len(temps) < tmp or temps[tmp] is None or is_output:
-        logger.debug(f"Symbolic tmp: {tmp}")
-        stmts = get_slice(statements, tmp)
-        for stmt in stmts:
-            logger.debug(f"stmt: {stmt.__str__()}")
-        df = DataFlowAnalyzer(curr_state)
-        tmp_values, tmp_taint, operand_map = df.process_irsb(stmts)
-        return tmp_values[tmp]
-    else:
-        return temps[tmp]
+    stmts = get_slice(statements, tmp)
+
+    for stmt in stmts:
+        logger.debug(f"stmt: {stmt.__str__()}")
+
+    df = DataFlowAnalyzer(curr_state)
+    tmp_values, tmp_taint, operand_map = df.process_irsb(stmts)
+    return tmp_values[tmp]
+
 
 
 def adjust_length(output_val, input_val):
@@ -236,7 +234,12 @@ def check_overflow(curr_state, result, input1, input2, signed=False):
         overflow_cond = claripy.Or(result < input1, result < input2)
 
     solver.add(overflow_cond)
-    return solver.satisfiable()
+    if not solver.satisfiable():
+        return False
+
+    concrete_value1 = solver.eval(input1)
+    concrete_value2 = solver.eval(input2)
+    logger.warning(f"Concrete values that work are: {concrete_value1}, {concrete_value2}")
 
 
 def check_symbolic_tmps(curr_state: angr.sim_state.SimState, statements, idx: int, stmt, output, input1, input2):
@@ -246,64 +249,22 @@ def check_symbolic_tmps(curr_state: angr.sim_state.SimState, statements, idx: in
     input1_val = resolve_operand_value(curr_state, statements, input1)
     input2_val = resolve_operand_value(curr_state, statements, input2)
 
+    logger.debug(f"Constraints on output_val: {output_val}")
     if isinstance(output_val, claripy.ast.bv.BV) and isinstance(input1_val, claripy.ast.bv.BV) and isinstance(input2_val, claripy.ast.bv.BV):
         input1_val = adjust_length(output_val, input1_val)
         input2_val = adjust_length(output_val, input2_val)
 
         result = input1_val + input2_val
         is_signed = False
-        logger.warning(f"Checking for overflow ({output}, {input1}, {input2}: {input1_val} + {input2_val} = {result}")
+        logger.warning(f"Checking for overflow @ {hex(curr_state.addr)} ({output}, {input1}, {input2}: {input1_val} + {input2_val} = {result}")
         logger.debug(curr_state.solver.constraints)
         if check_overflow(curr_state, result, input1_val, input2_val, signed=is_signed):
-            concrete_value1 = curr_state.solver.eval(input1_val)
-            concrete_value2 = curr_state.solver.eval(input2_val)
-            logger.warning(f"Concrete values that work are: {concrete_value1}, {concrete_value2}")
+            logger.warning("Possible overflow detected.")
+
         else:
             logger.warning("No values satisfy the condition.")
     else:
         logger.debug("Unsupported operand type")
-
-
-def extract_operand(curr_state, vex, idx, stmt, input_operands):
-
-    """
-
-    steps:
-
-    1. Check if both operands are available in scratch
-    2. If not, extract the operands from the statements (Const or RdTmp)
-
-    """
-    both_operands_available = True
-    input_tmps = []
-
-    for operand in input_operands:
-
-        if (hasattr(operand, 'tmp')):
-            if len(curr_state.scratch.temps) > operand.tmp:
-                input_val = curr_state.scratch.temps[operand.tmp]
-                if input_val is None:
-                    both_operands_available = False
-                    break
-                else:
-                    input_tmps.append(operand.tmp)
-            else:
-                both_operands_available = False
-                break
-
-    if both_operands_available:
-        logger.debug("Both operands are available in scratch")
-        try:
-            check_tmp(curr_state, stmt, stmt.tmp, input_tmps[0])
-        except:
-            both_operands_available = False
-
-
-    if not both_operands_available:
-        logger.debug("Extracting operands from statements")
-        input1 = input_operands[0]
-        input2 = input_operands[1]
-        check_symbolic_tmps(curr_state, vex.statements, idx, stmt, stmt.tmp, input1, input2)
 
 
 def check_for_vulns(simgr, proj):
@@ -345,18 +306,13 @@ def check_for_vulns(simgr, proj):
             mnemonic = cap.insns[get_capstone_from_vex(vex, idx)].mnemonic
             if (mnemonic.startswith("add") or mnemonic.startswith('inc')) and \
                (stmt.data.op.startswith("Iop_Add") or stmt.data.op.startswith("Iop_Shl")):
+                logger.debug(f"Statement: {stmt}")
                 logger.debug("Checking for overflow on t%d" % stmt.tmp)
-                input_operands = [stmt.data.args[0], stmt.data.args[1]]
-                extract_operand(curr_state, vex, idx, stmt, input_operands)
-                """
-                
-                output = stmt.tmp
-                if all_temps_available(curr_state, input_operands, output):
-                    if check_tmp(curr_state, stmt, output, input1.tmp):
-                        logger.debug("t%d is overflowed" % stmt.tmp)
-                else:
-                    check_symbolic_tmps(curr_state, vex.statements, idx, stmt, output, input1, input2)
-                """
+
+                input1 = stmt.data.args[0]
+                input2 = stmt.data.args[1]
+                logger.debug(f"Inputs: {input1}, {input2}")
+                check_symbolic_tmps(curr_state, vex.statements, idx, stmt, stmt.tmp, input1, input2)
 
             else:
                 # TODO: mul and sub

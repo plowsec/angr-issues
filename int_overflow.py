@@ -240,6 +240,7 @@ def check_overflow(curr_state, result, input1, input2, signed=False):
     concrete_value1 = solver.eval(input1)
     concrete_value2 = solver.eval(input2)
     logger.warning(f"Concrete values that work are: {concrete_value1}, {concrete_value2}")
+    return True
 
 
 def check_symbolic_tmps(curr_state: angr.sim_state.SimState, statements, idx: int, stmt, output, input1, input2):

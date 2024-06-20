@@ -32,6 +32,8 @@ analyzed_functions = set()
 
 oob_addresses = set()
 
+logging.getLogger("angr.exploration_techniques").setLevel(logging.DEBUG)
+
 
 
 
@@ -186,16 +188,42 @@ def get_small_coverage(*args, **kwargs):
         i += 1
 
 
+def pretty_print_callstack(state):
+    # Initialize an empty string to store the formatted call stack
+    state_history = "Call Stack:\n"
+
+    # Access the knowledge base of functions
+    kb_functions = state.project.kb.functions
+
+    # Iterate over the basic block addresses in the state's history
+    for i, addr in enumerate(state.history.bbl_addrs.hardcopy):
+        # Retrieve the function information from the knowledge base
+        func = kb_functions.floor_func(addr)
+
+        # Format the address and function prototype if available
+        if func:
+            fname = func.human_str if hasattr(func, 'human_str') else func.name
+            func_prototype = func.prototype if hasattr(func, 'prototype') else ""
+            state_history += f"{' ' * (i * 2)}-> 0x{addr:x} : {fname} {func_prototype} ({len(list(func.xrefs))} xrefs)\n"
+        else:
+            state_history += f"{' ' * (i * 2)}-> 0x{addr:x} : Unknown function\n"
+
+    # Print the formatted call stack
+    logger.debug(state_history)
+
 def inspect_call(state):
+
+    pretty_print_callstack(state)
+
     human_str = state.project.loader.describe_addr(state.addr)
     logger.debug(
-        f'call {hex(state.addr)} ({human_str}) from {hex(state.history.addr)} ({state.project.loader.describe_addr(state.addr)})')
+        f'[{hex(state.addr)}] call {hex(state.addr)} ({human_str}) from {hex(state.history.addr)} ({state.project.loader.describe_addr(state.addr)})')
     if "extern-address" in human_str and not state.project.is_hooked(state.addr):
         logger.warning(f"Implement hook for {hex(state.addr)} ({human_str})")
         pass
 
-    if not globals.proj.is_hooked(state.addr):
-        analyze_stack_vars(state)
+    #if not globals.proj.is_hooked(state.addr):
+    #    analyze_stack_vars(state)
 
 
 def next_base_addr(size=0x10000):
@@ -322,6 +350,9 @@ def rebased_addr(addr, ida_base):
 def set_hooks(proj):
     proj.hook_symbol('__stdio_common_vfprintf', hooks.stdio_common_vfprintf())
     proj.hook_symbol('__acrt_iob_func', hooks.acrt_iob_func())
+    proj.hook_symbol('printf', angr.procedures.libc.printf.printf())
+    proj.hook_symbol('sprintf', angr.procedures.libc.sprintf.sprintf())
+    proj.hook_symbol('fprintf', angr.procedures.libc.fprintf.fprintf())
 
 
 def check_for_vulns(*args, **kwargs):
@@ -502,6 +533,9 @@ def check_oob_write(state):
         logger.critical(f"SP is symbolic: {state.regs.sp}")
         return
 
+    if is_stack_operation(state):
+        return
+
     sp_val = state.solver.eval(state.regs.sp)
     rip = state.solver.eval(state.regs.rip)
     logger.debug(f"[{hex(rip)}] Memory write at {hex(mem_addr)} of size {mem_length} (sp: {hex(sp_val)})")
@@ -546,7 +580,7 @@ def check_oob_write(state):
     offset_diff = 0
     if rip > first_block.addr + first_block.size:
         try:
-            offset_diff = get_function_stack_offset(fn)
+            offset_diff = get_function_stack_offset(fn) # get the stack offset by matching Sub RSP, const operations
             sp_val += offset_diff
         except:
             logger.critical(f"Failed to get stack offset for function {fn.name}")
@@ -567,9 +601,9 @@ def check_oob_write(state):
                 return
 
         # If the write is not within any known buffer, it might be OOB
-        if not is_stack_operation(state):
-            logger.warning(f"[{hex(state.addr)}] Potential out-of-bounds write detected at sp+{hex(mem_addr-sp_val)} of size {mem_length}")
-            oob_addresses.add(mem_addr)
+
+        logger.warning(f"[{hex(state.addr)}] Potential out-of-bounds write detected at sp+{hex(mem_addr-sp_val)} of size {mem_length}")
+        oob_addresses.add(mem_addr)
     else:
         logger.debug(f"Write at {hex(mem_addr)} ({hex(mem_addr-sp_val)}) of size {mem_length} is not within stack bounds? ({hex(sp_val+min_offset)}-{hex(sp_val+max_offset)})")
         if mem_addr > sp_val + max_offset:
@@ -601,11 +635,12 @@ def analyze(angr_proj):
     addr_target = 0x0000000140001000
 
     # Get control flow graph.
-    globals.cfg = angr_proj.analyses.CFGFast(normalize=True )
+    #globals.cfg = angr_proj.analyses.CFGFast(normalize=True )
+    globals.cfg = angr_proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
 
     # Enumerate functions
     angr_enum_functions(angr_proj)
-    globals.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True)
+    globals.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=globals.cfg)
 
 
     # Set hooks
@@ -647,7 +682,7 @@ def analyze(angr_proj):
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     #state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
     # Set up the memory write inspection point
-    state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
+    #state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
 
     state.register_plugin("deep", SimStateDeepGlobals())
 
@@ -666,9 +701,31 @@ def analyze(angr_proj):
 
     # 00000001400010D0 loop overflow
     # 0x000000014000109D simple overflow
-    globals.simgr.explore(find=[0x140001397],
+    find_addresses = [0x1400014E5]
+
+    for f in find_addresses:
+        nodes = globals.cfg.model.get_all_nodes(f)
+        if len(nodes) == 0:
+            logger.critical(f"Node not found for address {hex(f)}. Specify the start of a basic block.")
+            func = globals.proj.kb.functions.floor_func(f)
+
+            if func is None:
+                logger.critical(f"This address is not even within a function.")
+                return
+
+            # enumerate all basic blocks and check if the address is within the range of any block
+            for block in func.blocks:
+                if block.addr <= f < block.addr + block.size:
+                    logger.debug(f"Try this one? {block}. Your address is in it.")
+                    break
+
+            return
+
+
+    globals.simgr.explore(find=find_addresses,
                           #avoid=[0x00000001400010E0],
-                          #step_func=check_for_vulns,
+                          step_func=check_for_vulns,
+        cfg=globals.cfg
                           )
 
     # IPython.embed()
@@ -677,6 +734,12 @@ def analyze(angr_proj):
     logger.debug(f'active: {len(s.active)}')
     logger.debug(f'found: {len(s.found)}')
     logger.debug(f'avoid: {len(s.avoid)}')
+    if len(s.avoid) > 0:
+        # pretty print the avoid states
+        for state in s.avoid:
+            logger.debug(f'avoid state: {state}')
+            pretty_print_callstack(state)
+
     logger.debug(f'deadended: {len(s.deadended)}')
     logger.debug(f'errored: {len(s.errored)}')
     logger.debug(f'unsat: {len(s.unsat)}')

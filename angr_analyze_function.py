@@ -13,15 +13,9 @@ import pyvex
 from exploration_techniques.CFGFollower import CFGFollower
 from helpers.log import logger
 from helpers import angr_introspection, state_plugin
-
-import int_overflow
-import shared
-import hooks
-import opcodes
-import utils
-
-import angr.calling_conventions
-import angr.sim_type
+from helpers import shared
+from targets.windows import hooks, utils, opcodes
+from sanitizers import integer_overflow
 
 
 logging.basicConfig(level=logging.DEBUG)
@@ -49,7 +43,7 @@ def check_for_vulns(*args, **kwargs):
         if state.loop_data.current_loop is not None and len(state.loop_data.current_loop) > 0:
             logger.debug(f'loop: {state.loop_data.current_loop}')
 
-    int_overflow.check_for_vulns(sm, shared.proj)
+    integer_overflow.check_for_vulns(sm, shared.proj)
     """for state in sm.active:
         logger.debug(f'{state.addr} {state.regs.rip}')
         detect_overflow(state)

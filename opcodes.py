@@ -1,4 +1,4 @@
-import globals
+import shared
 import utils
 import claripy
 import angr

@@ -3,7 +3,7 @@ import traceback
 
 import angr
 import claripy
-import globals
+import shared
 import utils
 import subprocess
 

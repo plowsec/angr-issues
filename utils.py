@@ -1,5 +1,5 @@
 import collections
-import globals
+import shared
 import sys
 import json
 

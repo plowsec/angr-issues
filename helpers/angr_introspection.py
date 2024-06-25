@@ -38,7 +38,7 @@ def get_small_coverage(*args, **kwargs):
         i += 1
 
 
-def pretty_print_callstack(state):
+def pretty_print_callstack(state, max_depth=10):
     # Initialize an empty string to store the formatted call stack
     state_history = "Call Stack:\n"
 
@@ -59,8 +59,8 @@ def pretty_print_callstack(state):
             state_history += f"{' ' * (i * 2)}-> 0x{addr:x} : Unknown function\n"
 
     # Print the formatted call stack
-    if len(state_history.split("\n")) > 13:
-        logger.debug("\n".join(state_history.split("\n")[:10]))
+    if len(state_history.split("\n")) > max_depth + 3:
+        logger.debug("\n".join(state_history.split("\n")[:max_depth]))
         logger.debug("...")
         logger.debug("\n".join(state_history.split("\n")[-3:]))
     else:

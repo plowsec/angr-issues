@@ -1,5 +1,6 @@
 import functools
 import pickle
+from typing import Dict, List, Tuple
 
 import angr
 import sys
@@ -24,6 +25,8 @@ logging.getLogger("angr.exploration_techniques").setLevel(logging.DEBUG)
 
 def inspect_new_constraint(state):
     logger.debug(f'new constraint {state.inspect.added_constraints}')
+
+
 
 
 def set_hooks(proj):
@@ -102,6 +105,7 @@ def create_simgr(proj, addr_target):
     #state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
 
     state.register_plugin("deep", state_plugin.SimStateDeepGlobals())
+    state.deep.memory_allocs = 0
 
     shared.state = state
     shared.simgr = proj.factory.simgr(state)
@@ -111,7 +115,7 @@ def create_simgr(proj, addr_target):
     return shared.simgr
 
 
-def exploration_done():
+def exploration_done(symbolic_vars=None):
     s = shared.simgr
     logger.debug(f'active: {len(s.active)}')
     logger.debug(f'found: {len(s.found)}')
@@ -201,11 +205,11 @@ def analyze(proj):
     # Enumerate functions
     angr_introspection.angr_enum_functions(proj)
     shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
-    run_heap_operations_addr = 0x1400011F0
-    should_have_crashed_addr = 0x140001274
+    run_heap_operations_addr = 0x1400011C0
+    should_have_crashed_addr = 0x14000120B
     count = claripy.BVS('count', 32)
-    operations = claripy.BVS('operations', 32 * 10)  # Assuming a maximum of 10 operations
-    values = claripy.BVS('values', 32 * 10)  # Assuming a maximum of 10 values
+    operations = claripy.BVS('operations', 32 * 3)  # Assuming a maximum of 10 operations
+    values = claripy.BVS('values', 32 * 3)  # Assuming a maximum of 10 values
 
     state = shared.proj.factory.blank_state()
     # Allocate memory for the buffer and store the symbolic buffer in memory
@@ -219,11 +223,29 @@ def analyze(proj):
 
     # Create a call state for the function
     state = shared.proj.factory.call_state(run_heap_operations_addr, operations_buf_addr, values_buf_addr, count, cc=shared.mycc,
-                                           prototype="void run_heap_operations(char *operations, char *values, int count);")
+                                           prototype="void run_heap_operations(int *operations, int *values, int count);")
 
     # Add constraints to the symbolic variables if needed
     state.solver.add(count > 0)
-    state.solver.add(count <= 10)  # Assuming a maximum of 10 operations
+    state.solver.add(count <= 3)  # Assuming a maximum of 10 operations
+
+    # add constraint use chop to tell angr the charset
+    for byte in operations.chop(32):
+        state.add_constraints(byte >= 0)  # '\x20'
+        state.add_constraints(byte <= 9)  # '\x7e'
+
+    for byte in values.chop(32):
+        state.add_constraints(byte >= 0)  #
+        state.add_constraints(byte <= 9)  #
+
+    # 3 1 100 2 0 3 0
+    state.add_constraints(operations.chop(32)[0] == 1)
+    state.add_constraints(operations.chop(32)[1] == 2)
+    state.add_constraints(operations.chop(32)[2] == 3)
+
+    state.add_constraints(values.chop(32)[0] == 8)
+    state.add_constraints(values.chop(32)[1] == 0)
+    state.add_constraints(values.chop(32)[2] == 0)
 
     state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
     state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
@@ -241,6 +263,42 @@ def analyze(proj):
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=heap_sanitizer.mem_read_hook)
 
     state.register_plugin("deep", state_plugin.SimStateDeepGlobals())
+    state_plugin.SimStateDeepGlobals.register_default('deep')
+    state.deep.memory_allocs = 0
+    state.globals["allocations"]: Dict[int, int] = {}
+    state.globals["freed_regions"]: List[Tuple[int, int]] = []
+
+    class HookVPrintf(angr.SimProcedure):
+        def run(self, fmt, arg):
+            # Resolve the format string
+            if self.state.solver.symbolic(fmt):
+                fmt_str = self.state.solver.eval(fmt)
+            else:
+                fmt_str = self.state.mem[fmt].string.concrete
+
+            # Read the argument (assuming it's a string pointer)
+            if self.state.solver.symbolic(arg):
+                arg_str = self.state.solver.eval(arg)
+            else:
+                arg_str = self.state.mem[arg].string
+                try:
+                    arg_str = arg_str.concrete.decode('utf-8')
+                except:
+                    arg_str = ""
+
+            # check if arg_str can be an int:
+            try:
+                arg_str = hex(int(arg_str))
+            except:
+                pass
+
+
+            # Print the resolved strings
+            logger.warning(f"Format: {fmt_str}")
+            logger.warning(f"Argument: {arg_str}")
+
+
+    proj.hook_symbol(0x140001440, HookVPrintf())
 
     shared.state = state
     shared.simgr = proj.factory.simgr(state)
@@ -263,7 +321,7 @@ def analyze(proj):
 
     #shared.simgr.run()
 
-    exploration_done()
+    exploration_done([operations, values])
 
 
 def main():

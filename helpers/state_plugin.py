@@ -3,6 +3,14 @@ from angr.state_plugins.plugin import SimStatePlugin
 from copy import deepcopy
 
 from helpers.log import logger
+from typing import Dict, List, Tuple
+
+
+class HeapState:
+    def __init__(self):
+        self.allocations: Dict[int, int] = {}  # addr -> size
+        self.freed_regions: List[Tuple[int, int]] = []  # (addr, size)
+
 
 
 class SimStateDeepGlobals(SimStatePlugin):
@@ -15,6 +23,9 @@ class SimStateDeepGlobals(SimStatePlugin):
         except RecursionError:
             logger.warning("Failed to deep copy, using shallow instead")
             self._backer = backer if backer is not None else {}
+
+        self.memory_allocs = 0
+        self.heap_state = HeapState()
 
     def set_state(self, state):
         pass

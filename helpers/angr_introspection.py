@@ -1,7 +1,8 @@
 import uuid
 
 from helpers.log import logger
-import shared
+from helpers import shared
+
 
 def get_small_coverage(*args, **kwargs):
     """
@@ -58,12 +59,17 @@ def pretty_print_callstack(state):
             state_history += f"{' ' * (i * 2)}-> 0x{addr:x} : Unknown function\n"
 
     # Print the formatted call stack
-    logger.debug(state_history)
+    if len(state_history.split("\n")) > 13:
+        logger.debug("\n".join(state_history.split("\n")[:10]))
+        logger.debug("...")
+        logger.debug("\n".join(state_history.split("\n")[-3:]))
+    else:
+        logger.debug(state_history)
 
 
 def inspect_call(state):
 
-    pretty_print_callstack(state)
+    # pretty_print_callstack(state)
 
     human_str = state.project.loader.describe_addr(state.addr)
     logger.debug(

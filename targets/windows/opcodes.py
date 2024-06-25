@@ -1,11 +1,9 @@
-import shared
-import utils
 import claripy
 import angr
 import ipdb
 
 from helpers.log import logger
-
+from targets.windows import utils
 
 def wrmsr_hook(state):
     # Check if we can control the parameters of wrmsr.

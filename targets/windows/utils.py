@@ -1,10 +1,9 @@
 import collections
-import shared
 import sys
 import json
 
 from helpers.log import logger
-
+from helpers import shared
 
 def tainted_buffer(s):
     # The tainted buffer contains only one symbolic variable.

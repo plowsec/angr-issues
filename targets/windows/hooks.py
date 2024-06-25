@@ -3,16 +3,15 @@ import traceback
 
 import angr
 import claripy
-import shared
-import utils
 import subprocess
 
 import re
-import opcodes
 
 import ipdb
 
 from helpers.log import logger
+from helpers import shared
+from targets.windows import utils, opcodes
 
 
 class acrt_iob_func(angr.SimProcedure):

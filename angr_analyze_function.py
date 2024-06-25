@@ -16,7 +16,7 @@ from helpers import angr_introspection, state_plugin
 from helpers import shared
 from targets.windows import hooks, utils, opcodes
 from sanitizers import integer_overflow
-
+from sanitizers import heap
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("angr.exploration_techniques").setLevel(logging.DEBUG)
@@ -35,8 +35,6 @@ def set_hooks(proj):
 
 
 def check_for_vulns(*args, **kwargs):
-
-
     sm = args[0]
 
     for state in sm.active:
@@ -51,7 +49,6 @@ def check_for_vulns(*args, **kwargs):
 
 
 def create_simgr(proj, addr_target):
-
     # Get control flow graph.
     #shared.cfg = angr_proj.analyses.CFGFast(normalize=True )
     shared.cfg = proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
@@ -59,7 +56,6 @@ def create_simgr(proj, addr_target):
     # Enumerate functions
     angr_introspection.angr_enum_functions(proj)
     shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
-
 
     # Set hooks
     set_hooks(proj)
@@ -100,7 +96,6 @@ def create_simgr(proj, addr_target):
 
     """
 
-
     state.inspect.b('call', when=angr.BP_BEFORE, action=angr_introspection.inspect_call)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     #state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
@@ -117,7 +112,6 @@ def create_simgr(proj, addr_target):
 
 
 def exploration_done():
-
     s = shared.simgr
     logger.debug(f'active: {len(s.active)}')
     logger.debug(f'found: {len(s.found)}')
@@ -125,7 +119,7 @@ def exploration_done():
 
     if len(s.avoid) > 0:
         # pretty print the avoid states
-        for state in s.avoid:
+        for state in s.avoid[:5]:
             logger.debug(f'avoid state: {state}')
             angr_introspection.pretty_print_callstack(state)
 
@@ -133,7 +127,7 @@ def exploration_done():
     logger.debug(f'errored: {len(s.errored)}')
 
     if len(s.errored) > 0:
-        for state in s.errored:
+        for state in s.errored[:5]:
             angr_introspection.show_errors(state)
 
     logger.debug(f'unsat: {len(s.unsat)}')
@@ -150,7 +144,6 @@ def exploration_done():
 
 
 def check_find_addresses(find_addresses):
-
     for f in find_addresses:
         nodes = shared.cfg.model.get_all_nodes(f)
         if len(nodes) == 0:
@@ -172,8 +165,7 @@ def check_find_addresses(find_addresses):
     return True
 
 
-def analyze(angr_proj):
-
+def analyze_old(angr_proj):
     addr_target = 0x0000000140001000
     create_simgr(angr_proj, addr_target)
 
@@ -194,7 +186,78 @@ def analyze(angr_proj):
     shared.simgr.explore(
         find=find_addresses,
         # avoid=[0x00000001400010E0],
-        # step_func=check_for_vulns,
+        step_func=check_for_vulns,
+        cfg=shared.cfg
+    )
+
+    #shared.simgr.run()
+
+    exploration_done()
+
+
+def analyze(proj):
+    shared.cfg = proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
+
+    # Enumerate functions
+    angr_introspection.angr_enum_functions(proj)
+    shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
+    run_heap_operations_addr = 0x1400011F0
+    should_have_crashed_addr = 0x140001274
+    count = claripy.BVS('count', 32)
+    operations = claripy.BVS('operations', 32 * 10)  # Assuming a maximum of 10 operations
+    values = claripy.BVS('values', 32 * 10)  # Assuming a maximum of 10 values
+
+    state = shared.proj.factory.blank_state()
+    # Allocate memory for the buffer and store the symbolic buffer in memory
+    operations_buf_addr = state.solver.BVV(0x100000, 64)  # Example address to store the buffer
+    state.memory.store(operations_buf_addr, operations)
+
+    values_buf_addr = state.solver.BVV(0x100500, 64)  # Example address to store the buffer
+    state.memory.store(values_buf_addr, values)
+
+    shared.mycc = angr.calling_conventions.SimCCMicrosoftAMD64(shared.proj.arch)
+
+    # Create a call state for the function
+    state = shared.proj.factory.call_state(run_heap_operations_addr, operations_buf_addr, values_buf_addr, count, cc=shared.mycc,
+                                           prototype="void run_heap_operations(char *operations, char *values, int count);")
+
+    # Add constraints to the symbolic variables if needed
+    state.solver.add(count > 0)
+    state.solver.add(count <= 10)  # Assuming a maximum of 10 operations
+
+    state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
+    state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
+
+    dispatcher = heap.HookDispatcher()
+    heap_sanitizer = heap.HeapSanitizer(proj, dispatcher, shared)
+    heap_sanitizer.install_hooks()
+
+    state.inspect.b('call', when=angr.BP_BEFORE, action=angr_introspection.inspect_call)
+    # state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
+    # state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
+    # state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
+
+    state.inspect.b('mem_write', when=angr.BP_BEFORE, action=heap_sanitizer.mem_write_hook)
+    state.inspect.b('mem_read', when=angr.BP_BEFORE, action=heap_sanitizer.mem_read_hook)
+
+    state.register_plugin("deep", state_plugin.SimStateDeepGlobals())
+
+    shared.state = state
+    shared.simgr = proj.factory.simgr(state)
+    shared.phase = 2
+
+    logger.debug(shared.simgr.active[0].regs.rip)
+
+    find_addresses = [should_have_crashed_addr]
+
+    check_find_addresses(find_addresses)
+
+    #shared.simgr.use_technique(CFGFollower(cfg=shared.cfg, find=find_addresses))
+
+    shared.simgr.explore(
+        find=find_addresses,
+        # avoid=[0x00000001400010E0],
+        #step_func=check_for_vulns,
         cfg=shared.cfg
     )
 

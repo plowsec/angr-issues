@@ -37,6 +37,11 @@ def get_small_coverage(*args, **kwargs):
             f.write(state_history)
         i += 1
 
+def debug_step_func(simgr):
+
+    for state in simgr.stashes["active"]:
+        logger.debug(f"Active state: {state}")
+        pretty_print_callstack(state, 50)
 
 def pretty_print_callstack(state, max_depth=10):
     # Initialize an empty string to store the formatted call stack

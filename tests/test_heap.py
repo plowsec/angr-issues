@@ -5,6 +5,8 @@ from unittest.mock import patch
 import angr
 import logging
 import claripy
+from angr_analyze_function import exploration_done
+from exploration_techniques.LeapFrogger import LeapFrogger
 
 from helpers.log import logger
 from helpers import shared, checks, angr_introspection
@@ -18,6 +20,10 @@ logging.getLogger("angr.engines").setLevel(logging.ERROR)
 logging.getLogger("claripy").setLevel(logging.ERROR)
 logging.getLogger("cle").setLevel(logging.ERROR)
 logging.getLogger("angr.misc").setLevel(logging.ERROR)
+logging.getLogger("angr.state_plugins").setLevel(logging.ERROR)
+logging.getLogger("angr.analyses.variable_recovery").setLevel(logging.ERROR)
+logging.getLogger("angr.analyses.cfg").setLevel(logging.ERROR)
+logging.getLogger("angr.analyses.complete_calling_conventions").setLevel(logging.ERROR)
 logging.getLogger("pyvex").setLevel(logging.ERROR)
 
 
@@ -33,7 +39,7 @@ class TestHeap(unittest.TestCase):
         shared.cfg = shared.proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
         shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
 
-        run_heap_operations_addr = 0x1400011C0
+        run_heap_operations_addr = 0x1400011D0
         count = claripy.BVS('count', 32)
         self.operations = claripy.BVS('operations', 32 * 3)  # Assuming a maximum of 10 operations
         operations = self.operations
@@ -83,27 +89,37 @@ class TestHeap(unittest.TestCase):
     @patch('helpers.log.logger.warning')
     def test_heap(self, mock_warning):
 
-        should_have_crashed_addr = 0x00000001400012DE # 0x1400012CB
+        should_have_crashed_addr = 0x1400012FB # 0x1400012CB
+        potential_uaf_str_addr = 0x140001117
 
         # 3 1 100 2 0 3 0
-        #self.state.add_constraints(self.operations.chop(32)[0] == 31337)
+        self.state.add_constraints(self.operations.chop(32)[0] == 31337)
 
-        shared.proj.hook_symbol(0x1400014E0, libc.HookVPrintf())
+        shared.proj.hook_symbol(0x140001500, libc.HookVPrintf())
 
         shared.simgr = shared.proj.factory.simgr(self.state)
-        find_addresses = [should_have_crashed_addr]
+        find_addresses = [potential_uaf_str_addr, should_have_crashed_addr]
         checks.check_find_addresses(find_addresses)
 
-        shared.simgr.explore(
+
+        #shared.simgr.explore(
+        shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
+        """
             find=find_addresses,
+            num_find=len(find_addresses),
             # avoid=[0x00000001400010E0],
             #step_func=check_for_vulns,
-            cfg=shared.cfg
+            #cfg=shared.cfg
         )
+        """
+
+        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+
+        exploration_done()
 
         self.assertTrue(len(shared.simgr.found) > 0)
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
         angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
-        called_with_substring = any('UaF at 0x14000110F' in str(call_args) for call_args in mock_warning.call_args_list)
+        called_with_substring = any('UaF at 0x140001139' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")

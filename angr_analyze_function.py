@@ -134,6 +134,12 @@ def exploration_done(symbolic_vars=None):
         for state in s.errored[:5]:
             angr_introspection.show_errors(state)
 
+    if len(s.deadended) > 0:
+        for state in s.deadended[:5]:
+            angr_introspection.pretty_print_callstack(state, max_depth=50)
+
+            logger.debug(f"State ended at {hex(state.addr)}")
+
     logger.debug(f'unsat: {len(s.unsat)}')
     logger.debug(f'uncons: {len(s.unconstrained)}')
 
@@ -144,6 +150,7 @@ def exploration_done(symbolic_vars=None):
         logger.debug("Found state")
         logger.debug(f'found: {found}')
     else:
+
         logger.debug("No found state")
 
 

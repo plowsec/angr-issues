@@ -149,6 +149,7 @@ def exploration_done(symbolic_vars=None):
         found = s.one_found
         logger.debug("Found state")
         logger.debug(f'found: {found}')
+        angr_introspection.pretty_print_callstack(found, max_depth=50)
     else:
 
         logger.debug("No found state")

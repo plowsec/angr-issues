@@ -87,20 +87,16 @@ class TestHeap(unittest.TestCase):
         state.globals["freed_regions"]: List[Tuple[int, int]] = []
 
     @patch('helpers.log.logger.warning')
-    def test_heap(self, mock_warning):
+    def test_use_after_free(self, mock_warning):
 
-        should_have_crashed_addr = 0x1400012FB # 0x1400012CB
+        should_have_crashed_addr = 0x140001318
         potential_uaf_str_addr = 0x140001117
-
-        # 3 1 100 2 0 3 0
         self.state.add_constraints(self.operations.chop(32)[0] == 31337)
-
-        shared.proj.hook_symbol(0x140001500, libc.HookVPrintf())
+        shared.proj.hook_symbol(0x140001520, libc.HookVPrintf()) # printf
 
         shared.simgr = shared.proj.factory.simgr(self.state)
         find_addresses = [potential_uaf_str_addr, should_have_crashed_addr]
         checks.check_find_addresses(find_addresses)
-
 
         #shared.simgr.explore(
         shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
@@ -123,3 +119,29 @@ class TestHeap(unittest.TestCase):
         angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
         called_with_substring = any('UaF at 0x140001139' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
+
+    @patch('helpers.log.logger.warning')
+    def test_double_free(self, mock_warning):
+
+        should_have_crashed_addr = 0x140001318
+        double_free_addr = 0x0000000140001157
+        self.state.add_constraints(self.operations.chop(32)[0] == 31338)
+        shared.proj.hook_symbol(0x140001520, libc.HookVPrintf())
+
+        shared.simgr = shared.proj.factory.simgr(self.state)
+        find_addresses = [double_free_addr, 0x140001040, double_free_addr, should_have_crashed_addr]
+        checks.check_find_addresses(find_addresses)
+
+        shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
+        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+
+        exploration_done()
+
+        self.assertTrue(len(shared.simgr.found) > 0)
+        mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
+
+        angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
+        called_with_substring = any('Double free detected' in str(call_args) for call_args in mock_warning.call_args_list)
+        self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
+        for call_args in mock_warning.call_args_list:
+            logger.warning(call_args)

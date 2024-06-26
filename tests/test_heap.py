@@ -1,4 +1,3 @@
-
 from typing import Dict, List, Tuple
 from unittest.mock import patch
 
@@ -26,9 +25,8 @@ logging.getLogger("angr.analyses.cfg").setLevel(logging.ERROR)
 logging.getLogger("angr.analyses.complete_calling_conventions").setLevel(logging.ERROR)
 logging.getLogger("pyvex").setLevel(logging.ERROR)
 
-
-
 import unittest
+
 
 class TestHeap(unittest.TestCase):
 
@@ -39,7 +37,7 @@ class TestHeap(unittest.TestCase):
         shared.cfg = shared.proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
         shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
 
-        run_heap_operations_addr = 0x1400011D0
+        run_heap_operations_addr = 0x0000000140001200
         count = claripy.BVS('count', 32)
         self.operations = claripy.BVS('operations', 32 * 3)  # Assuming a maximum of 10 operations
         operations = self.operations
@@ -56,9 +54,10 @@ class TestHeap(unittest.TestCase):
         shared.mycc = angr.calling_conventions.SimCCMicrosoftAMD64(shared.proj.arch)
 
         # Create a call state for the function
-        self.state = shared.proj.factory.call_state(run_heap_operations_addr, operations_buf_addr, values_buf_addr, count,
-                                               cc=shared.mycc,
-                                               prototype="void run_heap_operations(int *operations, int *values, int count);")
+        self.state = shared.proj.factory.call_state(run_heap_operations_addr, operations_buf_addr, values_buf_addr,
+                                                    count,
+                                                    cc=shared.mycc,
+                                                    prototype="void run_heap_operations(int *operations, int *values, int count);")
         state = self.state
         # Add constraints to the symbolic variables if needed
         state.solver.add(count > 0)
@@ -85,14 +84,15 @@ class TestHeap(unittest.TestCase):
 
         state.globals["allocations"]: Dict[int, int] = {}
         state.globals["freed_regions"]: List[Tuple[int, int]] = []
+        state.globals["shadow_info"]: Dict[int, Tuple[int, int]] = {}
 
     @patch('helpers.log.logger.warning')
     def test_use_after_free(self, mock_warning):
 
-        should_have_crashed_addr = 0x140001318
-        potential_uaf_str_addr = 0x140001117
+        should_have_crashed_addr = 0x140001348
+        potential_uaf_str_addr = 0x0000000140001144
         self.state.add_constraints(self.operations.chop(32)[0] == 31337)
-        shared.proj.hook_symbol(0x140001520, libc.HookVPrintf()) # printf
+        shared.proj.hook_symbol(0x0000000140001550, libc.HookVPrintf())  # printf
 
         shared.simgr = shared.proj.factory.simgr(self.state)
         find_addresses = [potential_uaf_str_addr, should_have_crashed_addr]
@@ -117,18 +117,20 @@ class TestHeap(unittest.TestCase):
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
         angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
-        called_with_substring = any('UaF at 0x140001139' in str(call_args) for call_args in mock_warning.call_args_list)
+        called_with_substring = any('UaF at 0x140001166' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
 
     @patch('helpers.log.logger.warning')
     def test_double_free(self, mock_warning):
 
-        should_have_crashed_addr = 0x140001318
-        double_free_addr = 0x0000000140001157
+        should_have_crashed_addr = 0x140001348
+        double_free_addr = 0x0000000140001176
         self.state.add_constraints(self.operations.chop(32)[0] == 31338)
-        shared.proj.hook_symbol(0x140001520, libc.HookVPrintf())
+        shared.proj.hook_symbol(0x0000000140001550, libc.HookVPrintf())
 
         shared.simgr = shared.proj.factory.simgr(self.state)
+
+        # it is required to add an intermediate address for LeapFrogger to know how to continue and loop back to the free node
         find_addresses = [double_free_addr, 0x140001040, double_free_addr, should_have_crashed_addr]
         checks.check_find_addresses(find_addresses)
 
@@ -141,7 +143,38 @@ class TestHeap(unittest.TestCase):
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
         angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
-        called_with_substring = any('Double free detected' in str(call_args) for call_args in mock_warning.call_args_list)
+        called_with_substring = any(
+            '0x140100058] Double free detected' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
         for call_args in mock_warning.call_args_list:
-            logger.warning(call_args)
+            logger.info(call_args)
+
+
+    @patch('helpers.log.logger.warning')
+    def test_oob(self, mock_warning):
+
+        should_have_crashed_addr = 0x140001348
+        oob_addr = 0x14000112D
+        self.state.add_constraints(self.operations.chop(32)[0] == 31339)
+        shared.proj.hook_symbol(0x0000000140001550, libc.HookVPrintf())
+
+        shared.simgr = shared.proj.factory.simgr(self.state)
+
+        # it is required to add an intermediate address for LeapFrogger to know how to continue and loop back to the free node
+        find_addresses = [oob_addr, should_have_crashed_addr]
+        checks.check_find_addresses(find_addresses)
+
+        shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
+        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+
+        exploration_done()
+
+        self.assertTrue(len(shared.simgr.found) > 0)
+        mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
+
+        angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
+        called_with_substring = any(
+            'OOB at' in str(call_args) for call_args in mock_warning.call_args_list)
+        self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
+        for call_args in mock_warning.call_args_list:
+            logger.info(call_args)

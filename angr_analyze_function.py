@@ -9,13 +9,13 @@ import logging
 import uuid
 
 import claripy
-import pyvex
 
 from exploration_techniques.CFGFollower import CFGFollower
 from helpers.log import logger
 from helpers import angr_introspection, state_plugin
-from helpers import shared
+from helpers import shared, checks
 from targets.windows import hooks, utils, opcodes
+from targets.generic import libc
 from sanitizers import integer_overflow
 from sanitizers import heap
 
@@ -147,26 +147,7 @@ def exploration_done(symbolic_vars=None):
         logger.debug("No found state")
 
 
-def check_find_addresses(find_addresses):
-    for f in find_addresses:
-        nodes = shared.cfg.model.get_all_nodes(f)
-        if len(nodes) == 0:
-            logger.critical(f"Node not found for address {hex(f)}. Specify the start of a basic block.")
-            func = shared.proj.kb.functions.floor_func(f)
 
-            if func is None:
-                logger.critical(f"This address is not even within a function.")
-                return False
-
-            # enumerate all basic blocks and check if the address is within the range of any block
-            for block in func.blocks:
-                if block.addr <= f < block.addr + block.size:
-                    logger.debug(f"Try this one? {block}. Your address is in it.")
-                    break
-
-            return False
-
-    return True
 
 
 def analyze_old(angr_proj):
@@ -183,7 +164,7 @@ def analyze_old(angr_proj):
     # 0x000000014000109D simple overflow
     find_addresses = [0x1400014E5]
 
-    check_find_addresses(find_addresses)
+    checks.check_find_addresses(find_addresses)
 
     #shared.simgr.use_technique(CFGFollower(cfg=shared.cfg, find=find_addresses))
 
@@ -206,7 +187,7 @@ def analyze(proj):
     angr_introspection.angr_enum_functions(proj)
     shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
     run_heap_operations_addr = 0x1400011C0
-    should_have_crashed_addr = 0x14000120B
+    should_have_crashed_addr = 0x00000001400012DE
     count = claripy.BVS('count', 32)
     operations = claripy.BVS('operations', 32 * 3)  # Assuming a maximum of 10 operations
     values = claripy.BVS('values', 32 * 3)  # Assuming a maximum of 10 values
@@ -232,14 +213,14 @@ def analyze(proj):
     # add constraint use chop to tell angr the charset
     for byte in operations.chop(32):
         state.add_constraints(byte >= 0)  # '\x20'
-        state.add_constraints(byte <= 9)  # '\x7e'
+        state.add_constraints(byte <= 31339)  # '\x7e'
 
     for byte in values.chop(32):
         state.add_constraints(byte >= 0)  #
         state.add_constraints(byte <= 9)  #
 
     # 3 1 100 2 0 3 0
-    state.add_constraints(operations.chop(32)[0] == 1)
+    #state.add_constraints(operations.chop(32)[0] == 1)
     state.add_constraints(operations.chop(32)[1] == 2)
     state.add_constraints(operations.chop(32)[2] == 3)
 
@@ -268,37 +249,8 @@ def analyze(proj):
     state.globals["allocations"]: Dict[int, int] = {}
     state.globals["freed_regions"]: List[Tuple[int, int]] = []
 
-    class HookVPrintf(angr.SimProcedure):
-        def run(self, fmt, arg):
-            # Resolve the format string
-            if self.state.solver.symbolic(fmt):
-                fmt_str = self.state.solver.eval(fmt)
-            else:
-                fmt_str = self.state.mem[fmt].string.concrete
 
-            # Read the argument (assuming it's a string pointer)
-            if self.state.solver.symbolic(arg):
-                arg_str = self.state.solver.eval(arg)
-            else:
-                arg_str = self.state.mem[arg].string
-                try:
-                    arg_str = arg_str.concrete.decode('utf-8')
-                except:
-                    arg_str = ""
-
-            # check if arg_str can be an int:
-            try:
-                arg_str = hex(int(arg_str))
-            except:
-                pass
-
-
-            # Print the resolved strings
-            logger.warning(f"Format: {fmt_str}")
-            logger.warning(f"Argument: {arg_str}")
-
-
-    proj.hook_symbol(0x140001440, HookVPrintf())
+    proj.hook_symbol(0x1400014E0, libc.HookVPrintf())
 
     shared.state = state
     shared.simgr = proj.factory.simgr(state)
@@ -308,7 +260,7 @@ def analyze(proj):
 
     find_addresses = [should_have_crashed_addr]
 
-    check_find_addresses(find_addresses)
+    checks.check_find_addresses(find_addresses)
 
     #shared.simgr.use_technique(CFGFollower(cfg=shared.cfg, find=find_addresses))
 

@@ -1,45 +1,41 @@
 import angr
 import claripy
 import monkeyhex
+from typing import Dict, List, Tuple, Union, Optional
 
 from helpers.log import logger
 from sanitizers.base import Sanitizer, HookDispatcher
 from helpers import angr_introspection
 
 
-
-
-def is_stack_operation(state):
+def is_stack_operation(state: angr.SimState) -> bool:
     """
     Determine if the current instruction is a stack operation such as return, push, or call.
     """
-    ip = state.solver.eval(state.regs.rip)
-    #insn = state.block().capstone.insns[state.inspect.instruction_index]
+    ip: int = state.solver.eval(state.regs.rip)
     for insn in state.block().capstone.insns:
         if insn.address == ip:
-            #logger.debug(f"0x{insn.address:x}:\t{insn.mnemonic}\t{insn.op_str}")
             break
     else:
         logger.warning(f"Instruction not found at address 0x{ip:x}")
         return False
 
-    mnemonic = insn.mnemonic
-    #logger.debug(f"Instruction mnemonic: {mnemonic}")
+    mnemonic: str = insn.mnemonic
     return mnemonic in ['ret', 'push', 'call']
 
 
 class MallocHook(angr.SimProcedure):
-    def run(self, size):
-        sim_size = self.state.solver.eval(size)
+    def run(self, size: claripy.ast.BV) -> claripy.ast.BV:
+        sim_size: int = self.state.solver.eval(size)
 
-        shadow_size = 16  # Size of shadow bytes (adjust as needed)
-        user_size = sim_size
-        total_size = shadow_size + user_size + shadow_size
+        shadow_size: int = 16  # Size of shadow bytes (adjust as needed)
+        user_size: int = sim_size
+        total_size: int = shadow_size + user_size + shadow_size
 
         # Align the total size to 16 bytes
         total_size = (total_size + 15) & ~15
 
-        addr = self.state.heap.heap_location
+        addr: int = self.state.heap.heap_location
         self.state.heap.heap_location += total_size
 
         # Find a free address
@@ -49,12 +45,18 @@ class MallocHook(angr.SimProcedure):
                 addr += self.state.globals["allocations"][addr]["total_size"]
             addr += 16
 
-        logger.debug(f"Allocating {total_size} bytes (including shadow bytes) at address {hex(addr)}")
+        user_addr: int = addr + shadow_size
+        end_addr: int = addr + total_size
+
+        logger.info(
+            f"MALLOC: req={sim_size}, total={total_size}, shadow={shadow_size}, addr=0x{addr:x}-0x{end_addr:x}, user=0x{user_addr:x}-0x{user_addr + user_size:x}")
 
         # Initialize shadow bytes
-        shadow_value = 0xAA  # Use a distinct value for shadow bytes
+        shadow_value: int = 0xAA  # Use a distinct value for shadow bytes
         self.state.memory.store(addr, bytes([shadow_value] * shadow_size))
-        self.state.memory.store(addr + shadow_size + user_size, bytes([shadow_value] * shadow_size))
+        self.state.memory.store(end_addr - shadow_size, bytes([shadow_value] * shadow_size))
+
+        logger.debug(f"SHADOW: before=0x{addr:x}-0x{user_addr:x}, after=0x{user_addr + user_size:x}-0x{end_addr:x}")
 
         # Store allocation information
         self.state.globals["allocations"][addr] = {
@@ -63,23 +65,24 @@ class MallocHook(angr.SimProcedure):
         }
         self.state.globals["shadow_info"][addr] = {
             "start": addr,
-            "end": addr + total_size,
-            "user_start": addr + shadow_size,
-            "user_end": addr + shadow_size + user_size,
+            "end": end_addr,
+            "user_start": user_addr,
+            "user_end": user_addr + user_size,
         }
 
-        logger.debug(f"malloc({sim_size}) = {hex(addr + shadow_size)}")
+        logger.info(f"malloc({sim_size}) = 0x{user_addr:x}")
 
         # Return the address of the user buffer (after the shadow bytes)
-        return addr + shadow_size
+        return claripy.BVV(user_addr, self.state.arch.bits)
+
 
 class FreeHook(angr.SimProcedure):
-    def run(self, ptr):
-        addr = self.state.solver.eval(ptr)
-        user_start = addr - 16
+    def run(self, ptr: claripy.ast.BV) -> claripy.ast.BV:
+        addr: int = self.state.solver.eval(ptr)
+        user_start: int = addr - 16
 
         if user_start in self.state.globals["allocations"]:
-            size = self.state.globals["allocations"].pop(user_start)
+            size: Dict[str, int] = self.state.globals["allocations"].pop(user_start)
             self.state.globals["freed_regions"].append((user_start, size))
             logger.debug(f"[{hex(self.state.addr)}] free({hex(addr)})")
             return claripy.BVV(0, self.state.arch.bits)
@@ -99,35 +102,31 @@ class FreeHook(angr.SimProcedure):
 
 
 class HeapSanitizer(Sanitizer):
-    def __init__(self, project, dispatcher: HookDispatcher, shared):
+    def __init__(self, project: angr.Project, dispatcher: HookDispatcher, shared):
         super().__init__(project)
         self.shared = shared
         self.dispatcher: HookDispatcher = dispatcher
         self.project.heap_sanitizer = self
-        self.shadow_size = 16
+        self.shadow_size: int = 16
 
-    def install_hooks(self):
+    def install_hooks(self) -> None:
         self.project.hook_symbol('malloc', MallocHook())
         self.project.hook_symbol('free', FreeHook())
         self.dispatcher.register_mem_read_hook(self.mem_read_hook)
         self.dispatcher.register_mem_write_hook(self.mem_write_hook)
 
-
-
-    def mem_read_hook(self, state):
-
+    def mem_read_hook(self, state: angr.SimState) -> None:
         if self.shared.proj.is_hooked(state.addr):
             return
 
-        mem_addr = state.inspect.mem_read_address
-        mem_length = state.inspect.mem_read_length
+        mem_addr: Optional[claripy.ast.BV] = state.inspect.mem_read_address
+        mem_length: Optional[claripy.ast.BV] = state.inspect.mem_read_length
 
         if mem_addr is None or mem_length is None:
             return
 
-        mem_addr = state.solver.eval(mem_addr)
-        mem_length = state.solver.eval(mem_length)
-
+        mem_addr: int = state.solver.eval(mem_addr)
+        mem_length: int = state.solver.eval(mem_length)
 
         if not state.regs.sp.concrete:
             logger.critical(f"SP is symbolic: {state.regs.sp}")
@@ -136,27 +135,23 @@ class HeapSanitizer(Sanitizer):
         if is_stack_operation(state):
             return
 
-        sp_val = state.solver.eval(state.regs.sp)
-        rip = state.solver.eval(state.regs.rip)
-        #logger.debug(f"[{hex(rip)}] Memory read at {hex(mem_addr)} of size {mem_length} (sp: {hex(sp_val)})")
-
+        sp_val: int = state.solver.eval(state.regs.sp)
+        rip: int = state.solver.eval(state.regs.rip)
 
         self.check_memory_access(state, mem_addr, mem_length)
 
-    def mem_write_hook(self, state):
-
+    def mem_write_hook(self, state: angr.SimState) -> None:
         if self.shared.proj.is_hooked(state.addr):
             return
 
-        mem_addr = state.inspect.mem_write_address
-        mem_length = state.inspect.mem_write_length
+        mem_addr: Optional[claripy.ast.BV] = state.inspect.mem_write_address
+        mem_length: Optional[claripy.ast.BV] = state.inspect.mem_write_length
 
         if mem_addr is None or mem_length is None:
             return
 
-        mem_addr = state.solver.eval(mem_addr)
-        mem_length = state.solver.eval(mem_length)
-
+        mem_addr: int = state.solver.eval(mem_addr)
+        mem_length: int = state.solver.eval(mem_length)
 
         if not state.regs.sp.concrete:
             logger.critical(f"SP is symbolic: {state.regs.sp}")
@@ -165,13 +160,12 @@ class HeapSanitizer(Sanitizer):
         if is_stack_operation(state):
             return
 
-        sp_val = state.solver.eval(state.regs.sp)
-        rip = state.solver.eval(state.regs.rip)
-        #logger.debug(f"[{hex(rip)}] Memory write at {hex(mem_addr)} of size {mem_length} (sp: {hex(sp_val)})")
+        sp_val: int = state.solver.eval(state.regs.sp)
+        rip: int = state.solver.eval(state.regs.rip)
 
         self.check_memory_access(state, mem_addr, mem_length)
 
-    def format_addr(self, addr):
+    def format_addr(self, addr: Union[int, claripy.ast.BV]) -> str:
         if isinstance(addr, int):
             return hex(addr)
         elif isinstance(addr, claripy.ast.bv.BV):
@@ -179,7 +173,7 @@ class HeapSanitizer(Sanitizer):
         else:
             return str(addr)
 
-    def check_memory_access(self, state, addr, size):
+    def check_memory_access(self, state: angr.SimState, addr: int, size: int) -> bool:
         logger.debug(
             f"[{hex(state.addr)}] Checking memory access at {hex(addr)} of size {size}, freed regions: {len(state.globals['freed_regions'])}, allocations: {len(state.globals['allocations'])}")
 
@@ -191,9 +185,9 @@ class HeapSanitizer(Sanitizer):
 
         return False
 
-    def check_use_after_free(self, state, addr, size):
-        addr_str = self.format_addr(addr)
-        freed_regions_str = ", ".join(
+    def check_use_after_free(self, state: angr.SimState, addr: int, size: int) -> bool:
+        addr_str: str = self.format_addr(addr)
+        freed_regions_str: str = ", ".join(
             [f"{self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size['user_size'])}" for
              (freed_addr, freed_size) in state.globals["freed_regions"]])
         logger.debug(f"Checking for UAF at {addr_str} in {freed_regions_str}")
@@ -204,21 +198,24 @@ class HeapSanitizer(Sanitizer):
                 return True
         return False
 
-    def is_uaf_access(self, state, addr, size, freed_addr, freed_size):
-        user_start = freed_addr + self.shadow_size
-        user_end = freed_addr + freed_size["user_size"]
-        uaf_constraints = [addr + size > user_start, addr < user_end]
+    def is_uaf_access(self, state: angr.SimState, addr: int|claripy.ast.BV, size: int|claripy.ast.BV, freed_addr: int,
+                      freed_size: Dict[str, int]) -> bool:
+        user_start: int = freed_addr + self.shadow_size
+        user_end: int = freed_addr + freed_size["user_size"]
+        uaf_constraints: List[claripy.ast.Bool] = [addr + size > user_start, addr < user_end]
         return state.solver.satisfiable(extra_constraints=uaf_constraints)
 
-    def log_uaf_access(self, state, addr, size, freed_addr, freed_size):
-        state_copy = state.copy()
-        uaf_constraints = [addr + size > freed_addr + self.shadow_size, addr < freed_addr + freed_size["user_size"]]
+    def log_uaf_access(self, state: angr.SimState, addr: int|claripy.ast.BV, size: int|claripy.ast.BV, freed_addr: int,
+                       freed_size: Dict[str, int]) -> None:
+        state_copy: angr.SimState = state.copy()
+        uaf_constraints: List[claripy.ast.Bool] = [addr + size > freed_addr + self.shadow_size,
+                                                   addr < freed_addr + freed_size["user_size"]]
         state_copy.add_constraints(*uaf_constraints)
 
-        concrete_addr = state_copy.solver.eval(addr) if state_copy.solver.unique(addr) else "symbolic"
-        concrete_size = state_copy.solver.eval(size) if state_copy.solver.unique(size) else "symbolic"
+        concrete_addr: Union[int, str] = state_copy.solver.eval(addr) if state_copy.solver.unique(addr) else "symbolic"
+        concrete_size: Union[int, str] = state_copy.solver.eval(size) if state_copy.solver.unique(size) else "symbolic"
 
-        offset_info = self.get_offset_info(concrete_addr, freed_addr)
+        offset_info: str = self.get_offset_info(concrete_addr, freed_addr)
 
         logger.warning(
             f"UaF at {hex(state.addr)}: access to {self.format_addr(concrete_addr) if isinstance(concrete_addr, int) else concrete_addr} "
@@ -226,13 +223,14 @@ class HeapSanitizer(Sanitizer):
 
         angr_introspection.pretty_print_callstack(state, max_depth=50)
 
-    def get_offset_info(self, concrete_addr, freed_addr):
+
+    def get_offset_info(self, concrete_addr: Union[int, str], freed_addr: int) -> str:
         if isinstance(concrete_addr, int):
-            offset = concrete_addr - freed_addr
+            offset: int = concrete_addr - freed_addr
             return f", offset +{offset}"
         return ", offset symbolic"
 
-    def check_out_of_bounds(self, state, addr, size):
+    def check_out_of_bounds(self, state: angr.SimState, addr: int, size: int) -> bool:
         for alloc_addr, alloc_info in state.globals["allocations"].items():
             if self.is_oob_access(state, addr, size, alloc_addr, alloc_info):
                 self.log_oob_access(state, addr, size, alloc_addr, alloc_info)
@@ -242,13 +240,16 @@ class HeapSanitizer(Sanitizer):
                 return True
         return False
 
-    def is_oob_access(self, state, addr, size, alloc_addr, alloc_info):
-        user_start = alloc_addr + self.shadow_size
-        user_end = user_start + alloc_info["user_size"]
-        oob_constraints = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info, user_start, user_end)
+    def is_oob_access(self, state: angr.SimState, addr: int, size: int, alloc_addr: int,
+                      alloc_info: Dict[str, int]) -> bool:
+        user_start: int = alloc_addr + self.shadow_size
+        user_end: int = user_start + alloc_info["user_size"]
+        oob_constraints: List[claripy.ast.Bool] = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info,
+                                                                           user_start, user_end)
         return state.solver.satisfiable(extra_constraints=oob_constraints)
 
-    def get_oob_constraints(self, state, addr, size, alloc_addr, alloc_info, user_start, user_end):
+    def get_oob_constraints(self, state: angr.SimState, addr: int, size: int, alloc_addr: int,
+                            alloc_info: Dict[str, int], user_start: int, user_end: int) -> List[claripy.ast.Bool]:
         return [
             state.solver.Or(
                 state.solver.And(addr >= user_start, addr < user_end, addr + size > user_end),
@@ -258,19 +259,23 @@ class HeapSanitizer(Sanitizer):
                                  addr < alloc_addr + alloc_info["total_size"] + self.shadow_size))
         ]
 
-    def log_oob_access(self, state, addr, size, alloc_addr, alloc_info):
-        state_copy = state.copy()
-        user_start = alloc_addr + self.shadow_size
-        user_end = user_start + alloc_info["user_size"]
-        oob_constraints = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info, user_start, user_end)
+    def log_oob_access(self, state: angr.SimState, addr: int|claripy.ast.BV, size: int|claripy.ast.BV, alloc_addr: int,
+                       alloc_info: Dict[str, int]) -> None:
+        state_copy: angr.SimState = state.copy()
+        user_start: int = alloc_addr + self.shadow_size
+        user_end: int = user_start + alloc_info["user_size"]
+        oob_constraints: List[claripy.ast.Bool] = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info,
+                                                                           user_start, user_end)
         state_copy.add_constraints(*oob_constraints)
 
-        concrete_addr = state_copy.solver.eval_one(addr) if state_copy.solver.unique(addr) else addr
-        concrete_size = state_copy.solver.eval_one(size) if state_copy.solver.unique(size) else size
+        concrete_addr: Union[int, claripy.ast.BV] = state_copy.solver.eval_one(addr) if state_copy.solver.unique(
+            addr) else addr
+        concrete_size: Union[int, claripy.ast.BV] = state_copy.solver.eval_one(size) if state_copy.solver.unique(
+            size) else size
 
-        distance_info = self.get_distance_info(state_copy, addr, size, user_start, user_end)
+        distance_info: str = self.get_distance_info(state_copy, addr, size, user_start, user_end)
 
-        log_message = (
+        log_message: str = (
             f"OOB at {self.format_addr(state.addr)}: "
             f"access to {self.format_addr(concrete_addr)} "
             f"(size: {concrete_size}), "
@@ -281,34 +286,37 @@ class HeapSanitizer(Sanitizer):
         logger.warning(log_message)
         angr_introspection.pretty_print_callstack(state, max_depth=20)
 
-    def get_distance_info(self, state, addr, size, user_start, user_end):
+    def get_distance_info(self, state: angr.SimState, addr: int | claripy.ast.BV, size: int | claripy.ast.BV,
+                          user_start: int, user_end: int) -> str:
         if state.solver.unique(addr) and state.solver.unique(size):
-            concrete_addr = state.solver.eval_one(addr)
-            concrete_size = state.solver.eval_one(size)
+            concrete_addr: int = state.solver.eval_one(addr)
+            concrete_size: int = state.solver.eval_one(size)
             if concrete_addr < user_start:
-                distance = user_start - concrete_addr
-                boundary = "lower"
+                distance: int = user_start - concrete_addr
+                boundary: str = "lower"
             elif concrete_addr >= user_end:
-                distance = concrete_addr - user_end
-                boundary = "upper"
+                distance: int = concrete_addr - user_end
+                boundary: str = "upper"
             else:
-                distance = (concrete_addr + concrete_size) - user_end
-                boundary = "upper"
+                distance: int = (concrete_addr + concrete_size) - user_end
+                boundary: str = "upper"
             return f", {self.format_addr(distance)} bytes beyond {boundary} bound"
         return ", distance symbolic"
 
-    def is_in_bounds_access(self, state, addr, size, alloc_addr, alloc_info):
-        user_start = alloc_addr + self.shadow_size
-        user_end = user_start + alloc_info["user_size"]
+    def is_in_bounds_access(self, state: angr.SimState, addr: int, size: int, alloc_addr: int,
+                            alloc_info: Dict[str, int]) -> bool:
+        user_start: int = alloc_addr + self.shadow_size
+        user_end: int = user_start + alloc_info["user_size"]
         return state.solver.satisfiable(extra_constraints=[
             state.solver.And(
                 addr >= user_start,
                 addr < user_end
             )])
 
-    def log_in_bounds_access(self, state, addr, size, alloc_addr, alloc_info):
-        user_start = alloc_addr + self.shadow_size
-        user_end = user_start + alloc_info["user_size"]
+    def log_in_bounds_access(self, state: angr.SimState, addr: int|claripy.ast.BV, size: int|claripy.ast.BV, alloc_addr: int,
+                             alloc_info: Dict[str, int]) -> None:
+        user_start: int = alloc_addr + self.shadow_size
+        user_end: int = user_start + alloc_info["user_size"]
         logger.info(
             f"Access starts in bounds at {self.format_addr(addr)} of size {size} in {self.format_addr(user_start)}-{self.format_addr(user_end)}")
         if state.solver.satisfiable(extra_constraints=[addr + size > user_end]):

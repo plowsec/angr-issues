@@ -49,7 +49,7 @@ class MallocHook(angr.SimProcedure):
         end_addr: int = addr + total_size
 
         logger.info(
-            f"MALLOC: req={sim_size}, total={total_size}, shadow={shadow_size}, addr=0x{addr:x}-0x{end_addr:x}, user=0x{user_addr:x}-0x{user_addr + user_size:x}")
+            f"MALLOC: req=0x{sim_size:x}, total=0x{total_size:x}, shadow=0x{shadow_size:x}, addr=0x{addr:x}-0x{end_addr:x}, user=0x{user_addr:x}-0x{user_addr + user_size:x}")
 
         # Initialize shadow bytes
         shadow_value: int = 0xAA  # Use a distinct value for shadow bytes
@@ -190,7 +190,7 @@ class HeapSanitizer(Sanitizer):
         freed_regions_str: str = ", ".join(
             [f"{self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size['user_size'])}" for
              (freed_addr, freed_size) in state.globals["freed_regions"]])
-        logger.debug(f"Checking for UAF at {addr_str} in {freed_regions_str}")
+        # logger.debug(f"[0x{state.addr:x}] Checking for UAF: {addr_str} in {freed_regions_str}")
 
         for (freed_addr, freed_size) in state.globals["freed_regions"]:
             if self.is_uaf_access(state, addr, size, freed_addr, freed_size):
@@ -251,12 +251,16 @@ class HeapSanitizer(Sanitizer):
     def get_oob_constraints(self, state: angr.SimState, addr: int, size: int, alloc_addr: int,
                             alloc_info: Dict[str, int], user_start: int, user_end: int) -> List[claripy.ast.Bool]:
         return [
-            state.solver.Or(
-                state.solver.And(addr >= user_start, addr < user_end, addr + size > user_end),
-                state.solver.And(addr < user_start, addr + size > user_start),
-                state.solver.And(addr < alloc_addr, addr + size > alloc_addr),
-                state.solver.And(addr >= alloc_addr + alloc_info["total_size"],
-                                 addr < alloc_addr + alloc_info["total_size"] + self.shadow_size))
+            state.solver.And(
+                alloc_addr < addr, addr < alloc_addr+alloc_info["total_size"]),
+                state.solver.Or(
+                    state.solver.And(addr >= user_start, addr + size > user_end),
+                    addr + size > user_end,
+                    addr < user_start,
+                    state.solver.And(addr < user_start),
+                    state.solver.And(addr < alloc_addr, addr + size > alloc_addr
+                )
+            )
         ]
 
     def log_oob_access(self, state: angr.SimState, addr: int|claripy.ast.BV, size: int|claripy.ast.BV, alloc_addr: int,
@@ -318,8 +322,5 @@ class HeapSanitizer(Sanitizer):
         user_start: int = alloc_addr + self.shadow_size
         user_end: int = user_start + alloc_info["user_size"]
         logger.info(
-            f"Access starts in bounds at {self.format_addr(addr)} of size {size} in {self.format_addr(user_start)}-{self.format_addr(user_end)}")
-        if state.solver.satisfiable(extra_constraints=[addr + size > user_end]):
-            logger.warning(
-                f"OOB access at {self.format_addr(state.addr)}: access to {self.format_addr(addr)} (size: {size}), user allocation: {self.format_addr(user_start)}-{self.format_addr(user_end)}")
-            angr_introspection.pretty_print_callstack(state, max_depth=20)
+            f"Access in bounds from {self.format_addr(addr)} to {self.format_addr(addr + size)} (size {size}) in region {self.format_addr(user_start)}-{self.format_addr(user_end)}")
+

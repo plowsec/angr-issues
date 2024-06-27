@@ -51,7 +51,8 @@ def pretty_print_callstack(state, max_depth=10):
     last_addr = None
     repeat_count = 0
     formatted_lines = []
-    current_indent = 0
+    call_stack = []
+    current_func = None
 
     for i, addr in enumerate(state.history.bbl_addrs.hardcopy):
         func = kb_functions.floor_func(addr)
@@ -63,7 +64,20 @@ def pretty_print_callstack(state, max_depth=10):
                 formatted_lines[-1] += f" (repeated {repeat_count + 1} times)"
                 repeat_count = 0
 
-            indent = ' ' * (current_indent * 2)
+            # Adjust indentation based on function calls and returns
+            if func != current_func:
+                if func in call_stack:
+                    # Function return
+                    while call_stack and call_stack[-1] != func:
+                        call_stack.pop()
+                    if call_stack:
+                        call_stack.pop()
+                else:
+                    # New function call
+                    call_stack.append(func)
+                current_func = func
+
+            indent = ' ' * (len(call_stack) * 2)
             if func:
                 fname = func.human_str if hasattr(func, 'human_str') else func.name
                 func_prototype = func.prototype if hasattr(func, 'prototype') else ""
@@ -71,8 +85,6 @@ def pretty_print_callstack(state, max_depth=10):
                     f"{indent}-> 0x{addr:x} : {fname} {func_prototype} ({len(list(func.xrefs))} xrefs)")
             else:
                 formatted_lines.append(f"{indent}-> 0x{addr:x} : Unknown function")
-
-            current_indent += 1
 
         last_addr = addr
 
@@ -83,10 +95,10 @@ def pretty_print_callstack(state, max_depth=10):
     state_history += "\n".join(formatted_lines)
 
     # Print the formatted call stack
-    if len(formatted_lines) > max_depth:
-        logger.debug("\n".join([state_history.split("\n")[0]] + formatted_lines[:max_depth // 2]))
-        logger.debug("...")
-        logger.debug("\n".join(formatted_lines[-max_depth // 2:]))
+    if len(formatted_lines) > max_depth + 3:
+        logger.debug("\n".join([state_history.split("\n")[0]] + formatted_lines[:max_depth]))
+        logger.debug(f"...(truncated {len(formatted_lines) - (max_depth+3)} lines)")
+        logger.debug("\n".join(formatted_lines[-3:]))
     else:
         logger.debug(state_history)
 

@@ -33,7 +33,17 @@ logging.getLogger("pyvex").setLevel(logging.ERROR)
 import unittest
 
 
+def log_and_pass(*args, **kwargs):
+    str_args = " ".join([str(arg) for arg in args])
+
+    logger.info(f"WARNING: {str_args}")
+    return None
+
+
 class TestHeap(unittest.TestCase):
+
+
+
 
     def setUp(self):
 
@@ -92,7 +102,7 @@ class TestHeap(unittest.TestCase):
         state.globals["shadow_info"]: Dict[int, Tuple[int, int]] = {}
 
     @patch('helpers.log.logger.warning')
-    def test_use_after_free(self, mock_warning):
+    def test_use_after_free(self, mock_warning, side_effect=log_and_pass):
 
         should_have_crashed_addr = 0x140001348
         potential_uaf_str_addr = 0x0000000140001144
@@ -125,7 +135,7 @@ class TestHeap(unittest.TestCase):
         called_with_substring = any('UaF at 0x140001166' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
 
-    @patch('helpers.log.logger.warning')
+    @patch('helpers.log.logger.warning', side_effect=log_and_pass)
     def test_double_free(self, mock_warning):
 
         should_have_crashed_addr = 0x140001348
@@ -155,7 +165,7 @@ class TestHeap(unittest.TestCase):
             logger.info(call_args)
 
 
-    @patch('helpers.log.logger.warning')
+    @patch('helpers.log.logger.warning', side_effect=log_and_pass)
     def test_oob(self, mock_warning):
 
         should_have_crashed_addr = 0x140001348

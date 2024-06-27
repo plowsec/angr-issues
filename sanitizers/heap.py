@@ -1,5 +1,6 @@
 import angr
 import claripy
+import monkeyhex
 
 from helpers.log import logger
 from sanitizers.base import Sanitizer, HookDispatcher
@@ -179,123 +180,138 @@ class HeapSanitizer(Sanitizer):
             return str(addr)
 
     def check_memory_access(self, state, addr, size):
+        logger.debug(
+            f"[{hex(state.addr)}] Checking memory access at {hex(addr)} of size {size}, freed regions: {len(state.globals['freed_regions'])}, allocations: {len(state.globals['allocations'])}")
 
+        if self.check_use_after_free(state, addr, size):
+            return True
 
-        logger.debug(f"[{hex(state.addr)}] Checking memory access at {hex(addr)} of size {size}, freed regions: {len(state.globals["freed_regions"])}, allocations: {len(state.globals["allocations"])}")
+        if self.check_out_of_bounds(state, addr, size):
+            return True
+
+        return False
+
+    def check_use_after_free(self, state, addr, size):
         addr_str = self.format_addr(addr)
-        freed_regions_str = ", ".join([f"{self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size["user_size"])}" for (freed_addr, freed_size) in state.globals["freed_regions"]])
-        # Check for UAF
+        freed_regions_str = ", ".join(
+            [f"{self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size['user_size'])}" for
+             (freed_addr, freed_size) in state.globals["freed_regions"]])
         logger.debug(f"Checking for UAF at {addr_str} in {freed_regions_str}")
 
         for (freed_addr, freed_size) in state.globals["freed_regions"]:
+            if self.is_uaf_access(state, addr, size, freed_addr, freed_size):
+                self.log_uaf_access(state, addr, size, freed_addr, freed_size)
+                return True
+        return False
 
-            user_start = freed_addr + self.shadow_size
-            user_end = freed_addr + freed_size["user_size"]
-            uaf_constraints = [addr + size > user_start, addr < user_end]
+    def is_uaf_access(self, state, addr, size, freed_addr, freed_size):
+        user_start = freed_addr + self.shadow_size
+        user_end = freed_addr + freed_size["user_size"]
+        uaf_constraints = [addr + size > user_start, addr < user_end]
+        return state.solver.satisfiable(extra_constraints=uaf_constraints)
 
-            if state.solver.satisfiable(extra_constraints=uaf_constraints):
+    def log_uaf_access(self, state, addr, size, freed_addr, freed_size):
+        state_copy = state.copy()
+        uaf_constraints = [addr + size > freed_addr + self.shadow_size, addr < freed_addr + freed_size["user_size"]]
+        state_copy.add_constraints(*uaf_constraints)
 
-                state_copy = state.copy()
-                state_copy.add_constraints(uaf_constraints[0])
-                state_copy.add_constraints(uaf_constraints[1])
+        concrete_addr = state_copy.solver.eval(addr) if state_copy.solver.unique(addr) else "symbolic"
+        concrete_size = state_copy.solver.eval(size) if state_copy.solver.unique(size) else "symbolic"
 
-                # Get concrete values if possible
-                concrete_addr = state_copy.solver.eval(addr) if state_copy.solver.unique(addr) else "symbolic"
-                concrete_size = state_copy.solver.eval(size) if state_copy.solver.unique(size) else "symbolic"
+        offset_info = self.get_offset_info(concrete_addr, freed_addr)
 
-                # Calculate offset from the start of the freed region
-                if isinstance(concrete_addr, int):
-                    offset = concrete_addr - freed_addr
-                    offset_info = f", offset +{offset}"
-                else:
-                    offset_info = ", offset symbolic"
+        logger.warning(
+            f"UaF at {hex(state.addr)}: access to {self.format_addr(concrete_addr) if isinstance(concrete_addr, int) else concrete_addr} "
+            f"(size: {concrete_size}), freed region: {self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size['user_size'])}{offset_info}")
 
-                logger.warning(
-                    f"UaF at {hex(state.addr)}: access to {self.format_addr(concrete_addr) if isinstance(concrete_addr, int) else concrete_addr} (size: {concrete_size}), freed region: {self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size["user_size"])}{offset_info}")
+        angr_introspection.pretty_print_callstack(state, max_depth=50)
 
-                angr_introspection.pretty_print_callstack(state, max_depth=50)
-                break
+    def get_offset_info(self, concrete_addr, freed_addr):
+        if isinstance(concrete_addr, int):
+            offset = concrete_addr - freed_addr
+            return f", offset +{offset}"
+        return ", offset symbolic"
 
-        # Check for out-of-bounds
+    def check_out_of_bounds(self, state, addr, size):
         for alloc_addr, alloc_info in state.globals["allocations"].items():
-            user_start = alloc_addr + self.shadow_size
-            user_end = user_start + alloc_info["user_size"]
-
-            oob_constraints = [
-                state.solver.Or(
-                    state.solver.And(addr >= user_start, addr < user_end, addr + size > user_end),
-                    state.solver.And(addr < user_start, addr + size > user_start),
-                    state.solver.And(addr < alloc_addr, addr + size > alloc_addr),
-                    state.solver.And(addr >= alloc_addr + alloc_info["total_size"],
-                                     addr < alloc_addr + alloc_info["total_size"] + self.shadow_size))
-            ]
-
-            if state.solver.satisfiable(extra_constraints=oob_constraints):
-                state_copy = state.copy()
-                state_copy.add_constraints(*oob_constraints)
-
-                concrete_addr = state_copy.solver.eval_one(addr) if state_copy.solver.unique(addr) else addr
-                concrete_size = state_copy.solver.eval_one(size) if state_copy.solver.unique(size) else size
-
-                # Calculate distance to relevant boundary
-                if state_copy.solver.unique(addr) and state_copy.solver.unique(size):
-                    concrete_addr = state_copy.solver.eval_one(addr)
-                    concrete_size = state_copy.solver.eval_one(size)
-                    if concrete_addr < user_start:
-                        distance = user_start - concrete_addr
-                        boundary = "lower"
-                    elif concrete_addr >= user_end:
-                        distance = concrete_addr - user_end
-                        boundary = "upper"
-                    else:
-                        distance = (concrete_addr + concrete_size) - user_end
-                        boundary = "upper"
-                    distance_info = f", {self.format_addr(distance)} bytes beyond {boundary} bound"
-                else:
-                    distance_info = ", distance symbolic"
-
-                log_message = (
-                    f"OOB at {self.format_addr(state.addr)}: "
-                    f"access to {self.format_addr(concrete_addr)} "
-                    f"(size: {concrete_size}), "
-                    f"user allocation: {self.format_addr(user_start)}-{self.format_addr(user_end)}"
-                    f"{distance_info}"
-                )
-
-                logger.warning(log_message)
-                angr_introspection.pretty_print_callstack(state, max_depth=20)
+            if self.is_oob_access(state, addr, size, alloc_addr, alloc_info):
+                self.log_oob_access(state, addr, size, alloc_addr, alloc_info)
                 return True
-
-            elif state.solver.satisfiable(extra_constraints=[
-                state.solver.And(
-                    addr >= user_start,
-                    addr < user_end
-                )]):
-
-                logger.info(
-                    f"Access starts in bounds at {self.format_addr(addr)} of size {size} in {self.format_addr(user_start)}-{self.format_addr(user_end)}")
-                if state.solver.satisfiable(extra_constraints=[
-                    addr + size > user_end
-                ]):
-                    logger.warning(
-                        f"OOB access at {self.format_addr(state.addr)}: access to {self.format_addr(addr)} (size: {size}), user allocation: {self.format_addr(user_start)}-{self.format_addr(user_end)}")
-                    angr_introspection.pretty_print_callstack(state, max_depth=20)
+            elif self.is_in_bounds_access(state, addr, size, alloc_addr, alloc_info):
+                self.log_in_bounds_access(state, addr, size, alloc_addr, alloc_info)
                 return True
+        return False
 
-            elif state.solver.satisfiable(extra_constraints=[
-                state.solver.Or(
-                    addr < user_start,
-                    addr + size > user_end
-                )
-            ]):
-                # This allocation is not relevant for this access
-                logger.info(
-                    f"Access at {self.format_addr(addr)} of size {size} is outside user allocation {self.format_addr(user_start)}-{self.format_addr(user_end)}")
+    def is_oob_access(self, state, addr, size, alloc_addr, alloc_info):
+        user_start = alloc_addr + self.shadow_size
+        user_end = user_start + alloc_info["user_size"]
+        oob_constraints = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info, user_start, user_end)
+        return state.solver.satisfiable(extra_constraints=oob_constraints)
+
+    def get_oob_constraints(self, state, addr, size, alloc_addr, alloc_info, user_start, user_end):
+        return [
+            state.solver.Or(
+                state.solver.And(addr >= user_start, addr < user_end, addr + size > user_end),
+                state.solver.And(addr < user_start, addr + size > user_start),
+                state.solver.And(addr < alloc_addr, addr + size > alloc_addr),
+                state.solver.And(addr >= alloc_addr + alloc_info["total_size"],
+                                 addr < alloc_addr + alloc_info["total_size"] + self.shadow_size))
+        ]
+
+    def log_oob_access(self, state, addr, size, alloc_addr, alloc_info):
+        state_copy = state.copy()
+        user_start = alloc_addr + self.shadow_size
+        user_end = user_start + alloc_info["user_size"]
+        oob_constraints = self.get_oob_constraints(state, addr, size, alloc_addr, alloc_info, user_start, user_end)
+        state_copy.add_constraints(*oob_constraints)
+
+        concrete_addr = state_copy.solver.eval_one(addr) if state_copy.solver.unique(addr) else addr
+        concrete_size = state_copy.solver.eval_one(size) if state_copy.solver.unique(size) else size
+
+        distance_info = self.get_distance_info(state_copy, addr, size, user_start, user_end)
+
+        log_message = (
+            f"OOB at {self.format_addr(state.addr)}: "
+            f"access to {self.format_addr(concrete_addr)} "
+            f"(size: {concrete_size}), "
+            f"user allocation: {self.format_addr(user_start)}-{self.format_addr(user_end)}"
+            f"{distance_info}"
+        )
+
+        logger.warning(log_message)
+        angr_introspection.pretty_print_callstack(state, max_depth=20)
+
+    def get_distance_info(self, state, addr, size, user_start, user_end):
+        if state.solver.unique(addr) and state.solver.unique(size):
+            concrete_addr = state.solver.eval_one(addr)
+            concrete_size = state.solver.eval_one(size)
+            if concrete_addr < user_start:
+                distance = user_start - concrete_addr
+                boundary = "lower"
+            elif concrete_addr >= user_end:
+                distance = concrete_addr - user_end
+                boundary = "upper"
             else:
-                # The access is within this allocation
-                logger.info(
-                    f"Access in bounds at {self.format_addr(addr)} of size {size} in {self.format_addr(user_start)}-{self.format_addr(user_end)}")
+                distance = (concrete_addr + concrete_size) - user_end
+                boundary = "upper"
+            return f", {self.format_addr(distance)} bytes beyond {boundary} bound"
+        return ", distance symbolic"
 
-        else:
-            #logger.debug(f"Invalid memory access at {addr}")
-            pass
+    def is_in_bounds_access(self, state, addr, size, alloc_addr, alloc_info):
+        user_start = alloc_addr + self.shadow_size
+        user_end = user_start + alloc_info["user_size"]
+        return state.solver.satisfiable(extra_constraints=[
+            state.solver.And(
+                addr >= user_start,
+                addr < user_end
+            )])
+
+    def log_in_bounds_access(self, state, addr, size, alloc_addr, alloc_info):
+        user_start = alloc_addr + self.shadow_size
+        user_end = user_start + alloc_info["user_size"]
+        logger.info(
+            f"Access starts in bounds at {self.format_addr(addr)} of size {size} in {self.format_addr(user_start)}-{self.format_addr(user_end)}")
+        if state.solver.satisfiable(extra_constraints=[addr + size > user_end]):
+            logger.warning(
+                f"OOB access at {self.format_addr(state.addr)}: access to {self.format_addr(addr)} (size: {size}), user allocation: {self.format_addr(user_start)}-{self.format_addr(user_end)}")
+            angr_introspection.pretty_print_callstack(state, max_depth=20)

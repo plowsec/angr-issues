@@ -1,2 +1,4 @@
 monkeyhex
 angr
+matplotlib
+pdbparse @ https://github.com/tetrane/pdbparse/raw/f29816285a5cbaf00bfe8c10379e664a5e4118ac/dist/pdbparse-1.5.1.tar.gz#sha256=1b046f137bc5b807983b15c1a1c71360faffad658be0ee4ba05763b0ab428486

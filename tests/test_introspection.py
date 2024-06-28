@@ -11,6 +11,7 @@ from helpers import shared, checks
 from core import introspection, coverage
 from targets.generic import libc
 from sanitizers import heap
+from targets.windows import symbols
 
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("angr.exploration_techniques").setLevel(logging.DEBUG)
@@ -41,14 +42,14 @@ class TestIntrospection(unittest.TestCase):
 
     def test_reachability(self):
 
-        reachable_blocks, reachable_functions = introspection.get_reachable_info(shared.cfg, self.entry_point)
+        reachable_blocks, reachable_functions = coverage.get_reachable_info(shared.cfg, self.entry_point)
         with open('reachable_blocks.txt', 'w') as f:
             f.write("\n".join([hex(block) for block in reachable_blocks]))
 
         for func in reachable_functions.keys():
             logger.info(f"Function: {shared.proj.kb.functions.get(func).name} ({len(reachable_functions[func])} nodes)")
 
-        overall_coverage, function_coverage = introspection.analyze_coverage(shared.proj, shared.cfg, self.entry_point, "cov")
+        overall_coverage, function_coverage = coverage.analyze_coverage(shared.proj, shared.cfg, self.entry_point, "cov")
 
         self.assertGreater(overall_coverage, 0)
         self.assertGreater(len(function_coverage), 0)
@@ -60,3 +61,9 @@ class TestIntrospection(unittest.TestCase):
         #coverage.monitor_coverage(shared.proj, shared.cfg, self.entry_point, duration=60.0)
         monitor = coverage.CoverageMonitor(shared.proj, shared.cfg, self.entry_point, update_interval=3.0)
         monitor.start_monitoring()
+
+    def test_symbols(self):
+
+        symbol_manager = symbols.SymbolManager(shared.proj)
+        symbol_manager.update_kb_with_symbols()
+        pass

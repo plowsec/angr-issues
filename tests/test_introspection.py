@@ -1,13 +1,14 @@
 import unittest
 import angr
-from helpers import introspection
+from core import introspection
 import logging
 import claripy
 from angr_analyze_function import exploration_done
 from exploration_techniques.LeapFrogger import LeapFrogger
 
 from helpers.log import logger
-from helpers import shared, checks, introspection
+from helpers import shared, checks
+from core import introspection, coverage
 from targets.generic import libc
 from sanitizers import heap
 
@@ -49,9 +50,13 @@ class TestIntrospection(unittest.TestCase):
 
         overall_coverage, function_coverage = introspection.analyze_coverage(shared.proj, shared.cfg, self.entry_point, "cov")
 
-        # Add assertions as needed
         self.assertGreater(overall_coverage, 0)
         self.assertGreater(len(function_coverage), 0)
 
         for func_name, data in sorted(function_coverage.items(), key=lambda x: x[1]['covered_blocks'], reverse=True):
             logger.info(f"Function: {func_name} ({data['covered_blocks']}/{data['total_blocks']} blocks covered)")
+
+
+        #coverage.monitor_coverage(shared.proj, shared.cfg, self.entry_point, duration=60.0)
+        monitor = coverage.CoverageMonitor(shared.proj, shared.cfg, self.entry_point, update_interval=3.0)
+        monitor.start_monitoring()

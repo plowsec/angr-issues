@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Union, Optional
 
 from helpers.log import logger
 from sanitizers.base import Sanitizer, HookDispatcher
-from helpers import introspection
+from core import introspection
 
 
 def is_stack_operation(state: angr.SimState) -> bool:

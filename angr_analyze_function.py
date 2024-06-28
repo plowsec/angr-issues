@@ -12,7 +12,8 @@ import claripy
 
 from exploration_techniques.CFGFollower import CFGFollower
 from helpers.log import logger
-from helpers import introspection, state_plugin
+from helpers import state_plugin
+from core import introspection
 from helpers import shared, checks
 from targets.windows import hooks, utils, opcodes
 from targets.generic import libc

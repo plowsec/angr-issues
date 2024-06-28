@@ -8,7 +8,8 @@ from angr_analyze_function import exploration_done
 from exploration_techniques.LeapFrogger import LeapFrogger
 
 from helpers.log import logger
-from helpers import shared, checks, introspection
+from helpers import shared, checks
+from core import introspection, coverage
 from targets.generic import libc
 from sanitizers import heap
 
@@ -53,6 +54,7 @@ class TestHeap(unittest.TestCase):
         shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
 
         run_heap_operations_addr = 0x0000000140001200
+        self.entry_point = run_heap_operations_addr
         count = claripy.BVS('count', 32)
         self.operations = claripy.BVS('operations', 32 * 3)  # Assuming a maximum of 10 operations
         operations = self.operations
@@ -178,7 +180,9 @@ class TestHeap(unittest.TestCase):
         # it is required to add an intermediate address for LeapFrogger to know how to continue and loop back to the free node
         find_addresses = [oob_addr, should_have_crashed_addr]
         checks.check_find_addresses(find_addresses)
-
+        #coverage.monitor_coverage(shared.proj, shared.cfg, self.entry_point, duration=60.0)
+        monitor = coverage.CoverageMonitor(shared.proj, shared.cfg, self.entry_point, update_interval=3.0, coverage_dir="cov")
+        monitor.start_monitoring()
         shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
         shared.simgr.run(step_func=introspection.debug_step_func, n=1000)
 
@@ -193,3 +197,5 @@ class TestHeap(unittest.TestCase):
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
         for call_args in mock_warning.call_args_list:
             logger.info(call_args)
+
+        monitor.stop_monitoring()

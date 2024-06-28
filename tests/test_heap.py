@@ -8,7 +8,7 @@ from angr_analyze_function import exploration_done
 from exploration_techniques.LeapFrogger import LeapFrogger
 
 from helpers.log import logger
-from helpers import shared, checks, angr_introspection
+from helpers import shared, checks, introspection
 from targets.generic import libc
 from sanitizers import heap
 
@@ -124,14 +124,14 @@ class TestHeap(unittest.TestCase):
         )
         """
 
-        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+        shared.simgr.run(step_func=introspection.debug_step_func, n=1000)
 
         exploration_done()
 
         self.assertTrue(len(shared.simgr.found) > 0)
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
-        angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
+        introspection.pretty_print_callstack(shared.simgr.found[0], 20)
         called_with_substring = any('UaF at 0x140001166' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
 
@@ -150,14 +150,14 @@ class TestHeap(unittest.TestCase):
         checks.check_find_addresses(find_addresses)
 
         shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
-        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+        shared.simgr.run(step_func=introspection.debug_step_func, n=1000)
 
         exploration_done()
 
         self.assertTrue(len(shared.simgr.found) > 0)
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
-        angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
+        introspection.pretty_print_callstack(shared.simgr.found[0], 20)
         called_with_substring = any(
             '0x140100058] Double free detected' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")
@@ -180,14 +180,14 @@ class TestHeap(unittest.TestCase):
         checks.check_find_addresses(find_addresses)
 
         shared.simgr.use_technique(LeapFrogger(bb_addresses=find_addresses))
-        shared.simgr.run(step_func=angr_introspection.debug_step_func, n=1000)
+        shared.simgr.run(step_func=introspection.debug_step_func, n=1000)
 
         exploration_done()
 
         self.assertTrue(len(shared.simgr.found) > 0)
         mock_warning.assert_called_with(unittest.mock.ANY)  # Checks if warning was called with any argument
 
-        angr_introspection.pretty_print_callstack(shared.simgr.found[0], 20)
+        introspection.pretty_print_callstack(shared.simgr.found[0], 20)
         called_with_substring = any(
             'OOB at' in str(call_args) for call_args in mock_warning.call_args_list)
         self.assertTrue(called_with_substring, "Warning was not called with the expected substring")

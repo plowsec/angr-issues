@@ -12,7 +12,7 @@ import claripy
 
 from exploration_techniques.CFGFollower import CFGFollower
 from helpers.log import logger
-from helpers import angr_introspection, state_plugin
+from helpers import introspection, state_plugin
 from helpers import shared, checks
 from targets.windows import hooks, utils, opcodes
 from targets.generic import libc
@@ -57,7 +57,7 @@ def create_simgr(proj, addr_target):
     shared.cfg = proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
 
     # Enumerate functions
-    angr_introspection.angr_enum_functions(proj)
+    introspection.angr_enum_functions(proj)
     shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
 
     # Set hooks
@@ -99,7 +99,7 @@ def create_simgr(proj, addr_target):
 
     """
 
-    state.inspect.b('call', when=angr.BP_BEFORE, action=angr_introspection.inspect_call)
+    state.inspect.b('call', when=angr.BP_BEFORE, action=introspection.inspect_call)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     #state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
     #state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)
@@ -125,18 +125,18 @@ def exploration_done(symbolic_vars=None):
         # pretty print the avoid states
         for state in s.avoid[:5]:
             logger.debug(f'avoid state: {state}')
-            angr_introspection.pretty_print_callstack(state)
+            introspection.pretty_print_callstack(state)
 
     logger.debug(f'deadended: {len(s.deadended)}')
     logger.debug(f'errored: {len(s.errored)}')
 
     if len(s.errored) > 0:
         for state in s.errored[:5]:
-            angr_introspection.show_errors(state)
+            introspection.show_errors(state)
 
     if len(s.deadended) > 0:
         for state in s.deadended[:5]:
-            angr_introspection.pretty_print_callstack(state, max_depth=50)
+            introspection.pretty_print_callstack(state, max_depth=50)
 
             logger.debug(f"State ended at {hex(state.addr)}")
 
@@ -149,7 +149,7 @@ def exploration_done(symbolic_vars=None):
         found = s.one_found
         logger.debug("Found state")
         logger.debug(f'found: {found}')
-        angr_introspection.pretty_print_callstack(found, max_depth=50)
+        introspection.pretty_print_callstack(found, max_depth=50)
     else:
 
         logger.debug("No found state")
@@ -192,7 +192,7 @@ def analyze(proj):
     shared.cfg = proj.analyses.CFGEmulated(fail_fast=True, normalize=True, keep_state=True)
 
     # Enumerate functions
-    angr_introspection.angr_enum_functions(proj)
+    introspection.angr_enum_functions(proj)
     shared.proj.analyses.CompleteCallingConventions(recover_variables=True, analyze_callsites=True, cfg=shared.cfg)
     run_heap_operations_addr = 0x1400011C0
     should_have_crashed_addr = 0x00000001400012DE
@@ -243,7 +243,7 @@ def analyze(proj):
     heap_sanitizer = heap.HeapSanitizer(proj, dispatcher, shared)
     heap_sanitizer.install_hooks()
 
-    state.inspect.b('call', when=angr.BP_BEFORE, action=angr_introspection.inspect_call)
+    state.inspect.b('call', when=angr.BP_BEFORE, action=introspection.inspect_call)
     # state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     # state.inspect.b('address_concretization', when=angr.BP_AFTER, action=inspect_concretization)
     # state.inspect.b('mem_write', when=angr.BP_BEFORE, action=check_oob_write)

@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Union, Optional
 
 from helpers.log import logger
 from sanitizers.base import Sanitizer, HookDispatcher
-from helpers import angr_introspection
+from helpers import introspection
 
 
 def is_stack_operation(state: angr.SimState) -> bool:
@@ -221,7 +221,7 @@ class HeapSanitizer(Sanitizer):
             f"UaF at {hex(state.addr)}: access to {self.format_addr(concrete_addr) if isinstance(concrete_addr, int) else concrete_addr} "
             f"(size: {concrete_size}), freed region: {self.format_addr(freed_addr)}-{self.format_addr(freed_addr + freed_size['user_size'])}{offset_info}")
 
-        angr_introspection.pretty_print_callstack(state, max_depth=50)
+        introspection.pretty_print_callstack(state, max_depth=50)
 
 
     def get_offset_info(self, concrete_addr: Union[int, str], freed_addr: int) -> str:
@@ -288,7 +288,7 @@ class HeapSanitizer(Sanitizer):
         )
 
         logger.warning(log_message)
-        angr_introspection.pretty_print_callstack(state, max_depth=20)
+        introspection.pretty_print_callstack(state, max_depth=20)
 
     def get_distance_info(self, state: angr.SimState, addr: int | claripy.ast.BV, size: int | claripy.ast.BV,
                           user_start: int, user_end: int) -> str:
